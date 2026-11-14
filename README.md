@@ -2,7 +2,7 @@
 
 ---
 
-# LLM Proxy — Безопасный шлюз к LLM-провайдерам
+# LLM Proxy — "Безопасный" шлюз к LLM-провайдерам
 
 Высокопроизводительный HTTP-прокси для OpenAI-совместимых API (OpenAI, OpenRouter, GenOffice, vLLM и др.). written in Rust.
 
