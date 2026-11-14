@@ -120,7 +120,7 @@ skill:
 import nonexistent_library
 print(nonexistent_library.compute())
 ```
-```
+
 
 **Что получит GenOffice:**
 ```
