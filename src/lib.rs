@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
     routing::{get, post},
     Json, Router,
 };
@@ -94,7 +94,6 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-
 /// Ответ для GET /v1 и /v1/
 async fn api_root() -> Json<serde_json::Value> {
     Json(json!({
@@ -110,16 +109,14 @@ async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
         // Если allowlist пуст — показываем заглушку
         vec![json!({"id": "all", "object": "model", "owned_by": "proxy"})]
     } else {
-        state.cfg.allowed_models.iter().map(|m| {
-            json!({"id": m, "object": "model", "owned_by": "proxy"})
-        }).collect()
+        state
+            .cfg
+            .allowed_models
+            .iter()
+            .map(|m| json!({"id": m, "object": "model", "owned_by": "proxy"}))
+            .collect()
     };
 
-    Json(json!({
-        "object": "list",
-        "data": models
-    }))
-}
     Json(json!({
         "object": "list",
         "data": models
