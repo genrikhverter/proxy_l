@@ -82,9 +82,48 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/chat/completions/", post(proxy::chat_completions))
+        // Эндпоинт списка моделей (требуется для проверки подключения в Craft Anything)
+        .route("/v1/models", get(list_models))
+        .route("/v1/models/", get(list_models))
+        // Корневой путь /v1/ — некоторые клиенты пингуют его
+        .route("/v1", get(api_root))
+        .route("/v1/", get(api_root))
         // Ограничение размера тела: больше 1 МиБ -> автоматический 413, тело не читается в память.
         .layer(DefaultBodyLimit::max(config::MAX_BODY_BYTES))
         .with_state(state)
+}
+
+
+/// Ответ для GET /v1 и /v1/
+async fn api_root() -> Json<serde_json::Value> {
+    Json(json!({
+        "object": "list",
+        "data": [],
+        "message": "LLM Proxy is running. Use /v1/chat/completions for requests."
+    }))
+}
+
+/// Ответ для GET /v1/models — возвращаем allowed_models из конфига
+async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let models: Vec<serde_json::Value> = if state.cfg.allowed_models.is_empty() {
+        // Если allowlist пуст — показываем заглушку
+        vec![json!({"id": "all", "object": "model", "owned_by": "proxy"})]
+    } else {
+        state.cfg.allowed_models.iter().map(|m| {
+            json!({"id": m, "object": "model", "owned_by": "proxy"})
+        }).collect()
+    };
+
+    Json(json!({
+        "object": "list",
+        "data": models
+    }))
+}
+    Json(json!({
+        "object": "list",
+        "data": models
+    }))
 }
 
 /// Проверка живости для балансировщика/k8s. Никаких секретов не отдаёт.
