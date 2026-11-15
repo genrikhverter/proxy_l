@@ -78,19 +78,30 @@ impl AppState {
 ///
 /// Маршрутов ровно два: прокси НЕ умеет «сходить по любому пути».
 /// Это не открытый прокси, а узкий шлюз к одному платному эндпоинту.
+// lib.rs, build_router
+
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    // Роутер для чата (лимит 1 МиБ)
+    let chat_routes = Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
         .route("/v1/chat/completions/", post(proxy::chat_completions))
-        // Эндпоинт списка моделей (требуется для проверки подключения в Craft Anything)
+        .layer(DefaultBodyLimit::max(config::MAX_BODY_BYTES));
+
+    // Роутер для изображений (лимит 10 МиБ)
+    let image_routes = Router::new()
+        .route("/v1/images/generations", post(proxy::image_generations))
+        .route("/v1/images/generations/", post(proxy::image_generations))
+        .layer(DefaultBodyLimit::max(config::MAX_IMAGE_BODY_BYTES));
+
+    // Общие маршруты без лимита тела
+    Router::new()
+        .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/models/", get(list_models))
-        // Корневой путь /v1/ — некоторые клиенты пингуют его
         .route("/v1", get(api_root))
         .route("/v1/", get(api_root))
-        // Ограничение размера тела: больше 1 МиБ -> автоматический 413, тело не читается в память.
-        .layer(DefaultBodyLimit::max(config::MAX_BODY_BYTES))
+        .merge(chat_routes)
+        .merge(image_routes)
         .with_state(state)
 }
 

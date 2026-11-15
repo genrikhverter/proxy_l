@@ -563,3 +563,104 @@ mod tests {
         assert!(prepare_request(body, &cfg(&[], 100)).await.unwrap().stream);
     }
 }
+
+// proxy.rs
+
+/// Обработчик POST /v1/images/generations
+/// Проксирует запросы к OpenRouter Images API без модификации тела,
+/// но с проверкой модели и заменой ключа.
+pub async fn image_generations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let started = Instant::now();
+
+    // 1. Аутентификация клиента
+    let client =
+        security::authenticate(headers.get(header::AUTHORIZATION), &state.cfg.client_keys)?;
+
+    // 2. Rate limit
+    if !state.limiter.allow(client) {
+        tracing::warn!(client, "превышен лимит запросов (images)");
+        return Err(AppError::RateLimited);
+    }
+
+    // 3. Базовая валидация JSON и проверка модели
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("Тело запроса должно быть корректным JSON"))?;
+
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(AppError::BadRequest("Поле model обязательно"))?
+        .to_string();
+
+    if !state.cfg.allowed_models.is_empty() && !state.cfg.allowed_models.contains(&model) {
+        return Err(AppError::Forbidden);
+    }
+
+    // 4. Слот конкурентности
+    let _permit = state
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
+
+    // 5. Формируем URL для images endpoint
+    let images_url = {
+        let mut url = state.cfg.upstream_base.clone();
+        let path = format!("{}/images/generations", url.path().trim_end_matches('/'));
+        url.set_path(&path);
+        url
+    };
+
+    // 6. Запрос к провайдеру
+    let upstream = state
+        .http
+        .post(images_url)
+        .bearer_auth(&state.cfg.upstream_api_key)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .timeout(state.cfg.request_timeout)
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "не удалось выполнить запрос к images API");
+            if e.is_timeout() {
+                AppError::GatewayTimeout
+            } else {
+                AppError::Upstream("Не удалось связаться с провайдером")
+            }
+        })?;
+
+    let status = upstream.status();
+
+    // 7. Обработка ошибок
+    if !status.is_success() {
+        return Ok(upstream_error_response(upstream, status).await);
+    }
+
+    // 8. Чтение ответа (изображения в base64 могут быть большими)
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+
+    let bytes = read_capped(upstream, MAX_IMAGE_RESPONSE_BYTES).await?;
+
+    tracing::info!(
+        client,
+        model = %model,
+        status = status.as_u16(),
+        ms = started.elapsed().as_millis() as u64,
+        "image generation completed"
+    );
+
+    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+/// Лимит для ответа images API (50 МиБ — несколько изображений в base64)
+const MAX_IMAGE_RESPONSE_BYTES: usize = 50 * 1024 * 1024;

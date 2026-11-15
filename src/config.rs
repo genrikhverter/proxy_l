@@ -8,6 +8,10 @@ use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, time::Durati
 
 use reqwest::Url;
 
+/// Максимальный размер тела запроса для генерации изображений (10 МиБ).
+/// Изображения в base64 требуют большего лимита, чем текстовые чаты.
+pub const MAX_IMAGE_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Максимальный размер тела запроса от клиента (1 МиБ).
 /// Защищает от «заливки» гигантского промпта и исчерпания памяти.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
