@@ -3,15 +3,20 @@
 //! Порядок проверок важен: сначала дешёвые (ключ, лимит, JSON), и только потом
 //! дорогой сетевой запрос. Так мусорный трафик не доходит до платного API.
 //!
-//! Два провайдера:
-//! * основной — OpenAI-совместимый API;
-//! * Ollama — и через маршрутизацию по префиксу модели в `/v1/chat/completions`,
-//!   и через собственные native-эндпоинты `/api/*`.
+//! Доступ унифицирован: все провайдеры из `cfg.providers` (по приоритету)
+//! получают ОДИНАКОВЫЙ OpenAI-совместимый запрос. Если провайдер не отвечает
+//! (ошибка сети, таймаут) или вернул отказ (401/403/404/408/429/5xx),
+//! тот же запрос уходит следующему по приоритету. Прочие 4xx — ошибка в самом
+//! запросе клиента, повторять её на других провайдерах бессмысленно.
+//!
+//! Ollama — обычный провайдер в этом списке (kind = Ollama); её native-эндпоинты
+//! `/api/*` проксируются на первого провайдера типа Ollama без failover:
+//! там протокол свой (NDJSON), заменить его другим провайдером нельзя.
 
 use std::time::Instant;
 
 use crate::{
-    config::{Config, OllamaConfig, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES},
+    config::{Config, ProviderConfig, ProviderKind, MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES},
     security, AppState,
 };
 use axum::{
@@ -39,8 +44,10 @@ pub enum AppError {
     BadRequest(&'static str), // 400 — некорректное тело
     NotFound(&'static str),   // 404 — эндпоинт/провайдер не существует
     RateLimited,              // 429 — клиент превысил свой лимит
-    Busy,                     // 503 — все слоты к провайдеру заняты
+    Busy,                     // 503 — все слоты к провайдерам заняты
     Upstream(&'static str),   // 502 — проблема на стороне провайдера
+    /// 502 — ни один провайдер из списка не ответил (с динамической причиной).
+    UpstreamAll(String),
     GatewayTimeout,           // 504 — провайдер не ответил вовремя
 }
 
@@ -70,6 +77,14 @@ impl IntoResponse for AppError {
                 "Прокси перегружен, повторите позже",
             ),
             AppError::Upstream(m) => (StatusCode::BAD_GATEWAY, "upstream_error", m),
+            AppError::UpstreamAll(m) => {
+                // Динамическое сообщение: возвращаем ответ сразу, не выходя из match.
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"message": m, "type": "upstream_error"}})),
+                )
+                    .into_response();
+            }
             AppError::GatewayTimeout => (
                 StatusCode::GATEWAY_TIMEOUT,
                 "upstream_error",
@@ -93,16 +108,182 @@ impl IntoResponse for AppError {
 /// Разобранное и приведённое в порядок тело запроса.
 pub struct Prepared {
     pub body: Vec<u8>,
+    /// Имя модели так, как его указал клиент (для логов и allowlist).
     pub model: String,
     pub stream: bool,
-    /// Идёт ли этот запрос в Ollama (маршрутизация по префиксу модели).
-    pub to_ollama: bool,
+    /// Индекс провайдера, выбранного ЯВНО по префиксу модели (`ollama/llama3`).
+    /// `None` — идём по приоритету через весь список с failover.
+    pub explicit: Option<usize>,
+}
+
+/// Какой OpenAI-совместимый эндпоинт вызываем у провайдера.
+#[derive(Clone, Copy)]
+enum Endpoint {
+    ChatCompletions,
+    Images,
+}
+
+impl Endpoint {
+    fn url(self, p: &ProviderConfig) -> reqwest::Url {
+        match self {
+            Endpoint::ChatCompletions => p.chat_completions_url(),
+            Endpoint::Images => p.images_url(),
+        }
+    }
+}
+
+/// Результат dispatch: успех у одного из провайдеров или готовый ответ клиенту.
+enum Dispatched {
+    /// 2xx от провайдера. `permit` держит слот — для стрима он живёт до конца потока.
+    Upstream {
+        response: reqwest::Response,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        provider: usize,
+    },
+    /// Не-фейловерная 4xx-ошибка провайдера: отд клиенту как есть
+    /// (тело уже прочитано и приведено к безопасному виду).
+    Passthrough(Response),
+}
+
+/// Статусы, при которых запрос стоит повторить у следующего провайдера:
+/// * 401/403 — провайдер отверг НАШ ключ (он у этого провайдера не настроен/протух);
+/// * 404 — у провайдера нет такой модели или эндпоинта;
+/// * 408 — таймаут на стороне провайдера;
+/// * 429 — квота/лимит провайдера исчерпаны;
+/// * 5xx — авария на стороне провайдера.
+/// Прочие 4xx (400, 413, 422...) означают проблему в самом запросе —
+/// на другом провайдере будет та же ошибка, не тратим попытки.
+fn is_failover_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 404 | 408 | 429) || status.is_server_error()
+}
+
+/// Единая отправка запроса по списку провайдеров с failover по приоритету.
+///
+/// Для каждого кандидата по порядку: берём слот конкурентности, отправляем
+/// запрос; при сетевой ошибке, таймауте или фейловерном статусе — переходим
+/// к следующему. Первый успешный 2xx возвращается вместе со слотом
+/// (для стрима слот должен жить до конца потока).
+async fn dispatch_with_failover(
+    state: &AppState,
+    candidates: &[usize],
+    endpoint: Endpoint,
+    body: Vec<u8>,
+    accept: &'static str,
+    // Полный таймаут ставим ТОЛЬКО нестриминговым запросам: у стрима ответ
+    // может идти минутами, и общий таймаут оборвал бы его на середине.
+    // Для стрима работают connect_timeout и read_timeout (простой между кусками).
+    with_total_timeout: bool,
+) -> Result<Dispatched, AppError> {
+    let mut last_status: Option<u16> = None;
+    let mut busy: usize = 0;
+
+    for &idx in candidates {
+        let p = &state.cfg.providers[idx];
+
+        // Слот конкурентности: не больше N одновременных обращений к этому
+        // провайдеру. try_acquire — не ждём в очереди: если провайдер занят,
+        // честнее сразу попробовать следующего по приоритету.
+        let permit = match state.slots[idx].clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                busy += 1;
+                tracing::warn!(provider = %p.name, "слоты провайдера заняты, пробуем следующего по приоритету");
+                continue;
+            }
+        };
+
+        // Заголовки собираем с нуля — это «белый список»: ни Authorization
+        // клиента, ни Cookie, ни Host не утекут наружу. Ключ подставляется
+        // только здесь; провайдер без ключа (локальная Ollama) остаётся
+        // без Authorization вовсе.
+        let mut request = state
+            .http
+            .post(endpoint.url(p))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, accept)
+            .body(body.clone());
+
+        if let Some(key) = &p.api_key {
+            request = request.bearer_auth(key);
+        }
+        if with_total_timeout {
+            request = request.timeout(state.cfg.request_timeout);
+        }
+
+        match request.send().await {
+            Err(e) => {
+                // В лог идёт текст ошибки reqwest (URL, TLS, таймаут) — заголовков и ключей там нет.
+                tracing::warn!(
+                    provider = %p.name,
+                    error = %e,
+                    "провайдер не ответил, переходим к следующему по приоритету"
+                );
+                drop(permit);
+                continue;
+            }
+            Ok(upstream) => {
+                let status = upstream.status();
+                if status.is_success() {
+                    return Ok(Dispatched::Upstream {
+                        response: upstream,
+                        permit,
+                        provider: idx,
+                    });
+                }
+
+                if is_failover_status(status) {
+                    // Тело ошибки читаем для лога; 401/403 могут содержать
+                    // кусок нашего ключа — такое содержимое в лог не пишем.
+                    let error_body = read_capped(upstream, MAX_ERROR_BODY_BYTES)
+                        .await
+                        .unwrap_or_default();
+                    if matches!(status.as_u16(), 401 | 403) {
+                        tracing::error!(
+                            provider = %p.name,
+                            status = status.as_u16(),
+                            "провайдер отверг ключ прокси — проверьте api_key этого провайдера в UPSTREAMS (тело ошибки скрыто)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            provider = %p.name,
+                            status = status.as_u16(),
+                            body = %String::from_utf8_lossy(&error_body),
+                            "провайдер вернул отказ, переходим к следующему по приоритету"
+                        );
+                    }
+                    last_status = Some(status.as_u16());
+                    drop(permit);
+                    continue;
+                }
+
+                // Прочие 4xx — ошибка в запросе клиента (неизвестные параметры,
+                // кривой JSON и т.п.). Повтор на другом провайдере даст тот же
+                // результат — отдаём ответ как есть.
+                return Ok(Dispatched::Passthrough(
+                    upstream_error_response(upstream, status).await,
+                ));
+            }
+        }
+    }
+
+    if !candidates.is_empty() && busy == candidates.len() {
+        // Все слоты всех кандидатов заняты — это наша перегрузка, не вина провайдеров.
+        return Err(AppError::Busy);
+    }
+
+    Err(AppError::UpstreamAll(format!(
+        "Ни один из {} провайдеров не обработал запрос{}",
+        candidates.len(),
+        last_status
+            .map(|s| format!(" (последний ответ провайдера: HTTP {s})"))
+            .unwrap_or_default()
+    )))
 }
 
 /// Обработчик POST /v1/chat/completions.
 ///
-/// Модель с префиксом `ollama/` уходит в Ollama (её OpenAI-совместимый /v1),
-/// остальные — к основному провайдеру.
+/// Модель с префиксом `имя/` уходит ЗАДАННОМУ провайдеру, остальные —
+/// первому живому провайдеру по приоритету (с failover по списку).
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,116 +304,57 @@ pub async fn chat_completions(
     // 3. Разбор и валидация JSON (размер тела уже ограничен слоем DefaultBodyLimit).
     let prepared = prepare_request(&body, &state.cfg).await?;
 
-    // 4. Маршрутизация: префикс ollama/ => локальная Ollama.
-    let ollama = if prepared.to_ollama {
-        match &state.cfg.ollama {
-            Some(oc) => Some(oc.clone()),
-            None => {
-                return Err(AppError::BadRequest(
-                    "Модель с префиксом ollama/ указана, но Ollama выключена (OLLAMA_ENABLED=0?)",
-                ))
-            }
-        }
-    } else {
-        None
+    // 4. Кандидаты по приоритету: явный префикс модели → один провайдер,
+    //    иначе — весь список по порядку.
+    let candidates: Vec<usize> = match prepared.explicit {
+        Some(idx) => vec![idx],
+        None => (0..state.cfg.providers.len()).collect(),
     };
+    if candidates.is_empty() {
+        return Err(AppError::NotFound("Не настроен ни один провайдер"));
+    }
 
-    // 5. Слот конкурентности: не больше N одновременных обращений к провайдеру.
-    //    try_acquire — не ждём в очереди, а сразу отвечаем 503 (честный backpressure).
-    //    У Ollama свой пул слотов: одна тяжёлая локальная модель не должна
-    //    выедать слоты платного API и наоборот.
-    let permit = if ollama.is_some() {
-        state
-            .ollama_slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AppError::Busy)?
-    } else {
-        state
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AppError::Busy)?
-    };
+    // 5-6. Запрос к провайдерам с failover.
+    let accept = if prepared.stream { "text/event-stream" } else { "application/json" };
+    let dispatched = dispatch_with_failover(
+        &state,
+        &candidates,
+        Endpoint::ChatCompletions,
+        prepared.body.clone(),
+        accept,
+        !prepared.stream,
+    )
+    .await?;
 
-    // 6. Запрос к провайдеру. Заголовки собираем с нуля — это «белый список»:
-    //    ни Authorization клиента, ни Cookie, ни Host не утекут наружу.
-    let (url, api_key) = match &ollama {
-        Some(oc) => (oc.chat_completions_url(), oc.api_key.clone()),
-        None => (state.cfg.chat_completions_url(), Some(state.cfg.upstream_api_key.clone())),
-    };
+    // 7. Успех: стрим или обычный ответ.
+    let response = match dispatched {
+        Dispatched::Passthrough(resp) => return Ok(resp),
+        Dispatched::Upstream { response: upstream, permit, provider } => {
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-    let mut request = state
-        .http
-        .post(url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::ACCEPT,
-            if prepared.stream {
-                "text/event-stream"
+            let resp = if prepared.stream {
+                streaming_response(upstream, permit)
             } else {
-                "application/json"
-            },
-        )
-        .body(prepared.body);
+                let bytes = read_capped(upstream, MAX_RESPONSE_BYTES).await?;
+                ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+            };
 
-    // Ключ подставляется ТОЛЬКО здесь. Локальная Ollama без авторизации
-    // остаётся без Authorization вовсе.
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
-
-    if !prepared.stream {
-        // Полный таймаут ставим ТОЛЬКО нестриминговым запросам:
-        // у стрима ответ может идти минутами, и общий таймаут оборвал бы его на середине.
-        // Для стрима работают connect_timeout и read_timeout (простой между кусками).
-        request = request.timeout(state.cfg.request_timeout);
-    }
-
-    let upstream = request.send().await.map_err(|e| {
-        // В лог идёт текст ошибки reqwest (URL, TLS, таймаут) — заголовков и ключей там нет.
-        tracing::warn!(error = %e, ollama = ollama.is_some(), "не удалось выполнить запрос к провайдеру");
-        if e.is_timeout() {
-            AppError::GatewayTimeout
-        } else {
-            AppError::Upstream(if ollama.is_some() {
-                "Не удалось связаться с Ollama (запущена ли она?)"
-            } else {
-                "Не удалось связаться с провайдером"
-            })
+            tracing::info!(
+                client,
+                model = %prepared.model,
+                provider = %state.cfg.providers[provider].name,
+                stream = prepared.stream,
+                ms = started.elapsed().as_millis() as u64,
+                "запрос обработан"
+            );
+            resp
         }
-    })?;
-
-    let status = upstream.status();
-
-    // 7. Провайдер вернул ошибку.
-    if !status.is_success() {
-        return Ok(upstream_error_response(upstream, status).await);
-    }
-
-    // 8. Успех: стрим или обычный ответ.
-    let content_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-
-    let response = if prepared.stream {
-        streaming_response(upstream, permit)
-    } else {
-        let bytes = read_capped(upstream, MAX_RESPONSE_BYTES).await?;
-        ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
     };
 
-    tracing::info!(
-        client,
-        model = %prepared.model,
-        ollama = prepared.to_ollama,
-        stream = prepared.stream,
-        status = status.as_u16(),
-        ms = started.elapsed().as_millis() as u64,
-        "запрос обработан"
-    );
     Ok(response)
 }
 
@@ -241,18 +363,14 @@ pub async fn chat_completions(
 // ---------------------------------------------------------------------------
 
 /// Общая проверка входа native-эндпоинтов Ollama: аутентификация + лимит.
-/// Возвращает (номер клиента, слот конкурентности).
+/// Возвращает (номер клиента, индекс ollama-провайдера, слот конкурентности).
 async fn ollama_gate(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(usize, tokio::sync::OwnedSemaphorePermit), AppError> {
-    state
-        .cfg
-        .ollama
-        .as_ref()
-        .ok_or(AppError::NotFound(
-            "Ollama не настроена: OLLAMA_ENABLED=0 или пустой OLLAMA_BASE_URL",
-        ))?;
+) -> Result<(usize, usize, tokio::sync::OwnedSemaphorePermit), AppError> {
+    let idx = state.cfg.ollama_index().ok_or(AppError::NotFound(
+        "Ollama не настроена: нет провайдера ollama в UPSTREAMS",
+    ))?;
 
     let client =
         security::authenticate(headers.get(header::AUTHORIZATION), &state.cfg.client_keys)?;
@@ -261,13 +379,12 @@ async fn ollama_gate(
         return Err(AppError::RateLimited);
     }
 
-    let permit = state
-        .ollama_slots
+    let permit = state.slots[idx]
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::Busy)?;
 
-    Ok((client, permit))
+    Ok((client, idx, permit))
 }
 
 /// Обрабатывает POST к native-эндпоинту Ollama (`/api/chat`, `/api/generate`,
@@ -280,11 +397,11 @@ async fn ollama_proxy(
     path: &'static str,
 ) -> Result<Response, AppError> {
     let started = Instant::now();
-    let (client, permit) = ollama_gate(&state, &headers).await?;
-    let oc = state.cfg.ollama.clone().expect("проверено в ollama_gate");
+    let (client, idx, permit) = ollama_gate(&state, &headers).await?;
+    let oc = &state.cfg.providers[idx];
 
     // Валидируем и нормализуем тело: model обязательна, num_predict режем.
-    let body = ollama_prepare_body(&body, &state.cfg).await?;
+    let body = ollama_prepare_body(&body, &state.cfg, oc).await?;
 
     let stream = ollama_is_stream(&body);
 
@@ -309,7 +426,7 @@ async fn ollama_proxy(
     }
 
     let upstream = request.send().await.map_err(|e| {
-        tracing::warn!(error = %e, path, "не удалось выполнить запрос к Ollama");
+        tracing::warn!(error = %e, provider = %oc.name, path, "не удалось выполнить запрос к Ollama");
         if e.is_timeout() {
             AppError::GatewayTimeout
         } else {
@@ -340,8 +457,8 @@ async fn ollama_proxy(
 
     tracing::info!(
         client,
+        provider = %oc.name,
         path,
-        ollama = true,
         stream,
         status = status.as_u16(),
         ms = started.elapsed().as_millis() as u64,
@@ -414,12 +531,8 @@ async fn ollama_get_light(
     if !state.limiter.allow(client) {
         return Err(AppError::RateLimited);
     }
-    let oc = state
-        .cfg
-        .ollama
-        .as_ref()
-        .ok_or(AppError::NotFound("Ollama не настроена"))?
-        .clone();
+    let idx = state.cfg.ollama_index().ok_or(AppError::NotFound("Ollama не настроена"))?;
+    let oc = &state.cfg.providers[idx];
 
     let mut request = state
         .http
@@ -431,7 +544,7 @@ async fn ollama_get_light(
     }
 
     let upstream = request.send().await.map_err(|e| {
-        tracing::warn!(error = %e, path, "не удалось выполнить GET к Ollama");
+        tracing::warn!(error = %e, provider = %oc.name, path, "не удалось выполнить GET к Ollama");
         if e.is_timeout() {
             AppError::GatewayTimeout
         } else {
@@ -453,14 +566,17 @@ async fn ollama_get_light(
     Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
-/// Список моделей Ollama для /v1/models. `None` — Ollama недоступна
-/// (возвращаем просто пустой список, не ломаем эндпоинт).
-pub async fn ollama_model_list(state: &AppState, oc: &OllamaConfig) -> Option<Vec<String>> {
+/// Список моделей провайдера для /v1/models. `None` — провайдер недоступен
+/// (возвращаем просто без его моделей, не ломаем эндпоинт).
+/// У Ollama читаем native `/api/tags` (`models[].name`), у остальных —
+/// OpenAI-совместимый `base/models` (`data[].id`).
+pub async fn provider_model_list(state: &AppState, idx: usize) -> Option<Vec<String>> {
+    let p = &state.cfg.providers[idx];
     let mut request = state
         .http
-        .get(oc.tags_url())
+        .get(p.models_url())
         .timeout(std::time::Duration::from_secs(5));
-    if let Some(key) = &oc.api_key {
+    if let Some(key) = &p.api_key {
         request = request.bearer_auth(key);
     }
     let resp = request.send().await.ok()?;
@@ -469,18 +585,31 @@ pub async fn ollama_model_list(state: &AppState, oc: &OllamaConfig) -> Option<Ve
     }
     let bytes = read_capped(resp, 1024 * 1024).await.ok()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
-    let models = value
-        .get("models")?
-        .as_array()?
-        .iter()
-        .filter_map(|m| m.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    Some(models)
+    let field = match p.kind {
+        ProviderKind::Ollama => "models",
+        ProviderKind::OpenAi => "data",
+    };
+    let name_field = match p.kind {
+        ProviderKind::Ollama => "name",
+        ProviderKind::OpenAi => "id",
+    };
+    Some(
+        value
+            .get(field)?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m.get(name_field).and_then(Value::as_str).map(str::to_string))
+            .collect(),
+    )
 }
 
 /// Валидация тела native-запроса Ollama: JSON-объект, поле model,
 /// потолок `options.num_predict`, плюс python-санитизация сообщений чата.
-async fn ollama_prepare_body(body: &[u8], cfg: &Config) -> Result<Vec<u8>, AppError> {
+async fn ollama_prepare_body(
+    body: &[u8],
+    cfg: &Config,
+    oc: &ProviderConfig,
+) -> Result<Vec<u8>, AppError> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|_| AppError::BadRequest("Тело запроса должно быть корректным JSON"))?;
 
@@ -498,12 +627,7 @@ async fn ollama_prepare_body(body: &[u8], cfg: &Config) -> Result<Vec<u8>, AppEr
     // ollama/...), а native-запросы приходят с «голым» именем. Пропускаем, если
     // разрешено либо голое имя, либо имя с префиксом.
     if !cfg.allowed_models.is_empty() {
-        let prefix = cfg
-            .ollama
-            .as_ref()
-            .map(|oc| oc.model_prefix.as_str())
-            .unwrap_or_default();
-        let with_prefix = format!("{prefix}{model}");
+        let with_prefix = format!("{}{model}", oc.model_prefix);
         let allowed =
             cfg.allowed_models.contains(&model) || cfg.allowed_models.contains(&with_prefix);
         if !allowed {
@@ -731,6 +855,9 @@ fn streaming_response(
 
 /// Превращаем ошибку провайдера в ответ клиенту.
 ///
+/// Вызывается для НЕ-фейловерных статусов (прочие 4xx): такие ошибки значат
+/// «что-то не так с самим запросом», и на другом провайдере ответ был бы тем же.
+///
 /// Важный нюанс безопасности: тела ответов 401/403 НЕ проксируем.
 /// OpenAI в таком случае пишет «Incorrect API key provided: sk-abc***» — то есть
 /// отдаёт клиенту кусок НАШЕГО ключа. Такие ошибки скрываем полностью.
@@ -751,7 +878,7 @@ async fn upstream_error_response(upstream: reqwest::Response, status: StatusCode
         // Ни тела, ни его содержимого в лог: там может быть часть ключа.
         tracing::error!(
             status = status.as_u16(),
-            "провайдер отверг ключ прокси — проверьте UPSTREAM_API_KEY / OLLAMA_API_KEY"
+            "провайдер отверг ключ прокси — проверьте api_key провайдера в UPSTREAMS"
         );
         return AppError::Upstream("Провайдер отклонил учётные данные прокси").into_response();
     }
@@ -802,8 +929,9 @@ async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8
 /// Мы разбираем JSON и собираем его заново: наружу уходит ровно то, что проверили
 /// (никаких «двух тел» — одного для проверки, другого для провайдера).
 ///
-/// Маршрутизация: модель с префиксом Ollama (`ollama/llama3`) помечается
-/// `to_ollama = true`, префикс срезается (Ollama не знает его).
+/// Маршрутизация: модель с префиксом провайдера (`ollama/llama3`) помечается
+/// `explicit = Some(индекс)`, префикс срезается (провайдер его не знает).
+/// Модель без префикса идёт по приоритету всего списка.
 async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|_| AppError::BadRequest("Тело запроса должно быть корректным JSON"))?;
@@ -825,24 +953,26 @@ async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError
         return Err(AppError::Forbidden);
     }
 
-    // Маршрутизация в Ollama: у модели префикс, который Ollama не знает.
-    // Проверяем allowlist по ПОЛНОМУ имени (как его видит клиент), а наружу
-    // отдаём уже срезанное.
-    let (to_ollama, model_upstream) = match &cfg.ollama {
-        Some(oc) if !oc.model_prefix.is_empty() => {
-            if let Some(stripped) = model.strip_prefix(&oc.model_prefix) {
-                if stripped.is_empty() {
-                    return Err(AppError::BadRequest(
-                        "После префикса ollama/ должно быть имя модели",
-                    ));
-                }
-                (true, stripped.to_string())
-            } else {
-                (false, model.clone())
-            }
+    // Явная маршрутизация по префиксу: у каждого провайдера свой префикс
+    // (`ollama/`, `openai/`, ...). Проверяем allowlist по ПОЛНОМУ имени
+    // (как его видит клиент), а наружу отдаём уже срезанное.
+    let mut explicit = None;
+    let mut upstream_model = model.clone();
+    for (i, p) in cfg.providers.iter().enumerate() {
+        if p.model_prefix.is_empty() {
+            continue;
         }
-        _ => (false, model.clone()),
-    };
+        if let Some(stripped) = model.strip_prefix(&p.model_prefix) {
+            if stripped.is_empty() {
+                return Err(AppError::BadRequest(
+                    "После префикса провайдера должно быть имя модели",
+                ));
+            }
+            explicit = Some(i);
+            upstream_model = stripped.to_string();
+            break;
+        }
+    }
 
     // messages — обязательный непустой массив.
     // Используем match, т.к. and_then не работает с мутабельными ссылками напрямую.
@@ -887,9 +1017,9 @@ async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError
         _ => return Err(AppError::BadRequest("stream должен быть true или false")),
     };
 
-    // Подставляем «внутреннее» имя модели для Ollama.
-    if to_ollama {
-        obj.insert("model".into(), json!(model_upstream));
+    // Подставляем «внутреннее» имя модели (без префикса провайдера).
+    if explicit.is_some() {
+        obj.insert("model".into(), json!(upstream_model));
     }
 
     let body =
@@ -899,20 +1029,30 @@ async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError
         body,
         model,
         stream,
-        to_ollama,
+        explicit,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderKind;
     use std::{collections::HashSet, time::Duration};
 
-    fn cfg(models: &[&str], cap: u64) -> Config {
+    fn provider(name: &str, base: &str, kind: ProviderKind) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            base: reqwest::Url::parse(base).unwrap(),
+            api_key: Some("provider-key".into()),
+            kind,
+            model_prefix: format!("{name}/"),
+        }
+    }
+
+    fn cfg(providers: Vec<ProviderConfig>, models: &[&str], cap: u64) -> Config {
         Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            upstream_base: reqwest::Url::parse("https://api.example.com/v1").unwrap(),
-            upstream_api_key: "upstream".into(),
+            providers,
             client_keys: vec!["client-key-aaaaaaaaaaaaaaaa".into()],
             allowed_models: models.iter().map(|s| s.to_string()).collect::<HashSet<_>>(),
             max_output_tokens: cap,
@@ -922,36 +1062,47 @@ mod tests {
             idle_timeout: Duration::from_secs(10),
             python_bin: None,
             allow_http: false,
-            ollama: None,
         }
     }
 
+    fn single_cfg(models: &[&str], cap: u64) -> Config {
+        cfg(
+            vec![provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi)],
+            models,
+            cap,
+        )
+    }
+
     fn cfg_with_ollama(models: &[&str], cap: u64, prefix: &str) -> Config {
-        let mut c = cfg(models, cap);
-        c.ollama = Some(OllamaConfig {
-            base: reqwest::Url::parse("http://127.0.0.1:11434").unwrap(),
-            api_key: None,
-            model_prefix: prefix.into(),
-        });
-        c
+        let mut ollama = provider("ollama", "http://127.0.0.1:11434", ProviderKind::Ollama);
+        ollama.api_key = None;
+        ollama.model_prefix = prefix.into();
+        cfg(
+            vec![
+                provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi),
+                ollama,
+            ],
+            models,
+            cap,
+        )
     }
 
     #[tokio::test]
     async fn valid_request_passes() {
         let body = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
-        let p = prepare_request(body, &cfg(&["gpt-4o-mini"], 100))
+        let p = prepare_request(body, &single_cfg(&["gpt-4o-mini"], 100))
             .await
             .unwrap();
         assert_eq!(p.model, "gpt-4o-mini");
         assert!(!p.stream);
-        assert!(!p.to_ollama);
+        assert_eq!(p.explicit, None);
     }
 
     #[tokio::test]
     async fn max_tokens_is_clamped() {
         let body =
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#;
-        let p = prepare_request(body, &cfg(&[], 512)).await.unwrap();
+        let p = prepare_request(body, &single_cfg(&[], 512)).await.unwrap();
         let v: Value = serde_json::from_slice(&p.body).unwrap();
         assert_eq!(v["max_tokens"], 512);
     }
@@ -959,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn max_completion_tokens_is_clamped_too() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":99999}"#;
-        let p = prepare_request(body, &cfg(&[], 512)).await.unwrap();
+        let p = prepare_request(body, &single_cfg(&[], 512)).await.unwrap();
         let v: Value = serde_json::from_slice(&p.body).unwrap();
         assert_eq!(v["max_completion_tokens"], 512);
     }
@@ -968,14 +1119,14 @@ mod tests {
     async fn model_allowlist_enforced() {
         let body = br#"{"model":"expensive","messages":[{"role":"user","content":"hi"}]}"#;
         assert!(matches!(
-            prepare_request(body, &cfg(&["cheap"], 100)).await,
+            prepare_request(body, &single_cfg(&["cheap"], 100)).await,
             Err(AppError::Forbidden)
         ));
     }
 
     #[tokio::test]
     async fn bad_bodies_rejected() {
-        let c = cfg(&[], 100);
+        let c = single_cfg(&[], 100);
         assert!(prepare_request(b"not json", &c).await.is_err());
         assert!(prepare_request(b"[]", &c).await.is_err());
         assert!(prepare_request(br#"{"messages":[]}"#, &c).await.is_err());
@@ -991,27 +1142,40 @@ mod tests {
     #[tokio::test]
     async fn stream_must_be_boolean() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":"true"}"#;
-        assert!(prepare_request(body, &cfg(&[], 100)).await.is_err());
+        assert!(prepare_request(body, &single_cfg(&[], 100)).await.is_err());
     }
 
     #[tokio::test]
     async fn stream_flag_detected() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
-        assert!(prepare_request(body, &cfg(&[], 100)).await.unwrap().stream);
+        assert!(prepare_request(body, &single_cfg(&[], 100)).await.unwrap().stream);
     }
 
-    // ---- маршрутизация Ollama ----
+    // ---- маршрутизация по префиксу провайдера ----
 
     #[tokio::test]
     async fn ollama_prefix_routes_and_is_stripped() {
         let c = cfg_with_ollama(&["ollama/llama3"], 100, "ollama/");
         let body = br#"{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
-        assert!(p.to_ollama);
+        assert_eq!(p.explicit, Some(1), "префикс ollama/ → индекс 1");
         assert_eq!(p.model, "ollama/llama3");
         // наружу уходит срезанное имя
         let v: Value = serde_json::from_slice(&p.body).unwrap();
         assert_eq!(v["model"], "llama3");
+    }
+
+    #[tokio::test]
+    async fn prefixed_model_routes_to_its_own_provider() {
+        let c = cfg(vec![
+            provider("openai", "https://a.example.com/v1", ProviderKind::OpenAi),
+            provider("ollama", "http://127.0.0.1:11434", ProviderKind::Ollama),
+        ], &["openai/gpt-4o"], 100);
+        let body = br#"{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        assert_eq!(p.explicit, Some(0));
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(v["model"], "gpt-4o");
     }
 
     #[tokio::test]
@@ -1038,31 +1202,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_ollama_model_unaffected_by_prefix() {
+    async fn non_prefixed_model_unaffected_by_prefixes() {
         let c = cfg_with_ollama(&[], 100, "ollama/");
         let body = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
-        assert!(!p.to_ollama);
+        assert_eq!(p.explicit, None, "без префикса — failover по приоритету");
         let v: Value = serde_json::from_slice(&p.body).unwrap();
         assert_eq!(v["model"], "gpt-4o-mini");
     }
 
     #[tokio::test]
     async fn empty_prefix_disables_routing() {
-        let c = cfg_with_ollama(&[], 100, "");
+        let mut c = cfg_with_ollama(&[], 100, "");
+        c.providers[1].model_prefix = String::new();
         let body = br#"{"model":"llama3","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
-        assert!(!p.to_ollama);
+        assert_eq!(p.explicit, None);
     }
 
     #[tokio::test]
-    async fn ollama_prefix_with_ollama_disabled_errors() {
-        // ollama = None, но модель несёт префикс — пользователю объясняем причину.
-        let c = cfg(&[], 100);
+    async fn unknown_prefix_goes_by_priority() {
+        // префикс ollama/ не сконфигурирован — модель уходит по приоритету как есть
+        let c = single_cfg(&[], 100);
         let body = br#"{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}"#;
-        // prepare_request не знает о выключенной Ollama — префикс без Ollama не маршрутизируется
         let p = prepare_request(body, &c).await.unwrap();
-        assert!(!p.to_ollama); // путь — основной провайдер
+        assert_eq!(p.explicit, None);
+        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        assert_eq!(v["model"], "ollama/llama3");
+    }
+
+    // ---- failover: какие статусы заставляют пробовать следующего ----
+
+    #[test]
+    fn failover_statuses() {
+        for s in [401, 403, 404, 408, 429, 500, 502, 503, 504] {
+            assert!(
+                is_failover_status(StatusCode::from_u16(s).unwrap()),
+                "HTTP {s} должен вызывать failover"
+            );
+        }
+        for s in [400, 413, 422] {
+            assert!(
+                !is_failover_status(StatusCode::from_u16(s).unwrap()),
+                "HTTP {s} не должен вызывать failover"
+            );
+        }
     }
 
     // ---- native-тела Ollama ----
@@ -1070,8 +1254,9 @@ mod tests {
     #[tokio::test]
     async fn ollama_native_body_valid_and_num_predict_clamped() {
         let c = cfg_with_ollama(&[], 100, "ollama/");
+        let oc = c.ollama().unwrap().clone();
         let body = br#"{"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true,"options":{"num_predict":99999}}"#;
-        let out = ollama_prepare_body(body, &c).await.unwrap();
+        let out = ollama_prepare_body(body, &c, &oc).await.unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["options"]["num_predict"], 100);
     }
@@ -1079,9 +1264,10 @@ mod tests {
     #[tokio::test]
     async fn ollama_native_body_requires_model() {
         let c = cfg_with_ollama(&[], 100, "ollama/");
+        let oc = c.ollama().unwrap().clone();
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
-        assert!(ollama_prepare_body(body, &c).await.is_err());
-        assert!(ollama_prepare_body(b"not json", &c).await.is_err());
+        assert!(ollama_prepare_body(body, &c, &oc).await.is_err());
+        assert!(ollama_prepare_body(b"not json", &c, &oc).await.is_err());
     }
 
     #[tokio::test]
@@ -1095,16 +1281,18 @@ mod tests {
     async fn ollama_native_allowlist_checked() {
         // allowlist с полным именем (ollama/llama3) пропускает native-запрос «llama3»
         let c = cfg_with_ollama(&["ollama/llama3"], 100, "ollama/");
+        let oc = c.ollama().unwrap().clone();
         let body = br#"{"model":"llama3","messages":[]}"#;
-        assert!(ollama_prepare_body(body, &c).await.is_ok());
+        assert!(ollama_prepare_body(body, &c, &oc).await.is_ok());
 
         // чужая модель не проходит
         let body = br#"{"model":"gemma2","messages":[]}"#;
         assert!(matches!(
-            ollama_prepare_body(body, &c).await,
+            ollama_prepare_body(body, &c, &oc).await,
             Err(AppError::Forbidden)
         ));
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +1304,9 @@ const MAX_IMAGE_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Обработчик POST /v1/images/generations
 /// Проксирует запросы к Images API без модификации тела,
-/// но с проверкой модели и заменой ключа.
+/// но с проверкой модели и заменой ключа. Тот же failover по приоритету:
+/// провайдер без поддержки Images (например Ollama) вернёт 404/501,
+/// и запрос уйдёт следующему.
 pub async fn image_generations(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1148,61 +1338,41 @@ pub async fn image_generations(
         return Err(AppError::Forbidden);
     }
 
-    // 4. Слот конкурентности
-    let _permit = state
-        .slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::Busy)?;
-
-    // 5. Формируем URL для images endpoint
-    let images_url = {
-        let mut url = state.cfg.upstream_base.clone();
-        let path = format!("{}/images/generations", url.path().trim_end_matches('/'));
-        url.set_path(&path);
-        url
-    };
-
-    // 6. Запрос к провайдеру
-    let upstream = state
-        .http
-        .post(images_url)
-        .bearer_auth(&state.cfg.upstream_api_key)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCEPT, "application/json")
-        .timeout(state.cfg.request_timeout)
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "не удалось выполнить запрос к images API");
-            if e.is_timeout() {
-                AppError::GatewayTimeout
-            } else {
-                AppError::Upstream("Не удалось связаться с провайдером")
-            }
-        })?;
-
-    let status = upstream.status();
-
-    // 7. Обработка ошибок
-    if !status.is_success() {
-        return Ok(upstream_error_response(upstream, status).await);
+    // 4. Кандидаты — все провайдеры по приоритету.
+    let candidates: Vec<usize> = (0..state.cfg.providers.len()).collect();
+    if candidates.is_empty() {
+        return Err(AppError::NotFound("Не настроен ни один провайдер"));
     }
 
-    // 8. Чтение ответа (изображения в base64 могут быть большими)
-    let content_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    // 5-6. Запрос к провайдерам с failover.
+    let dispatched = dispatch_with_failover(
+        &state,
+        &candidates,
+        Endpoint::Images,
+        body.to_vec(),
+        "application/json",
+        true,
+    )
+    .await?;
 
-    let bytes = read_capped(upstream, MAX_IMAGE_RESPONSE_BYTES).await?;
+    // 7-8. Чтение ответа (изображения в base64 могут быть большими)
+    let (bytes, provider_idx, content_type) = match dispatched {
+        Dispatched::Passthrough(resp) => return Ok(resp),
+        Dispatched::Upstream { response: upstream, permit: _permit, provider } => {
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+            let bytes = read_capped(upstream, MAX_IMAGE_RESPONSE_BYTES).await?;
+            (bytes, provider, content_type)
+        }
+    };
 
     tracing::info!(
         client,
         model = %model,
-        status = status.as_u16(),
+        provider = %state.cfg.providers[provider_idx].name,
         ms = started.elapsed().as_millis() as u64,
         "image generation completed"
     );

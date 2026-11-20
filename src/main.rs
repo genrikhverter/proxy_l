@@ -24,23 +24,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(cfg.listen).await?;
     tracing::info!(
         listen = %cfg.listen,
-        upstream = %cfg.upstream_base,
+        providers = cfg.providers.len(),
         models = if cfg.allowed_models.is_empty() { "любые (задайте ALLOWED_MODELS!)".to_string() } else { format!("{:?}", cfg.allowed_models) },
         http_upstreams_allowed = cfg.allow_http,
         "прокси запущен"
     );
 
-    // Ollama: отдельная строка лога, чтобы было видно, куда пойдут запросы
-    // с префиксом ollama/ и native-эндпоинты /api/*.
-    match &cfg.ollama {
-        Some(oc) => tracing::info!(
-            ollama = %oc.base,
-            model_prefix = %oc.model_prefix,
-            auth = oc.api_key.is_some(),
-            "Ollama включена: /api/* и модели с префиксом {} маршрутизируются в неё",
-            oc.model_prefix
-        ),
-        None => tracing::info!("Ollama выключена (OLLAMA_ENABLED=0 или пустой OLLAMA_BASE_URL)"),
+    // Провайдеры в порядке приоритета: первый живой обрабатывает запрос,
+    // остальные — резерв при недоступности/ошибках предыдущего.
+    for (i, p) in cfg.providers.iter().enumerate() {
+        tracing::info!(
+            priority = i + 1,
+            provider = %p.name,
+            base = %p.base,
+            kind = if p.kind == llm_proxy::config::ProviderKind::Ollama { "ollama (+ /api/*)" } else { "openai-compatible" },
+            auth = p.api_key.is_some(),
+            model_prefix = %p.model_prefix,
+            "провайдер настроен"
+        );
+    }
+    if cfg.ollama().is_none() {
+        tracing::info!(
+            "Ollama не настроена: native-эндпоинты /api/* отключены, \
+             добавьте провайдера ollama в UPSTREAMS при необходимости"
+        );
     }
 
     // Graceful shutdown: по Ctrl-C перестаём принимать новые соединения

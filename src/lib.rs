@@ -1,10 +1,10 @@
-//! Простой прокси к внешним LLM-провайдерам.
+//! Простой прокси к внешним LLM-провайдерам с приоритетным failover.
 //!
 //! Схема работы:
 //!
 //! ```text
-//!   ваш клиент                 этот прокси                    провайдер
-//!  (SDK, curl)                 llm-proxy                      (OpenAI и т.п.)
+//!   ваш клиент                 этот прокси                  провайдеры (по приоритету)
+//!  (SDK, curl)                 llm-proxy                    1. primary   2. ollama  ...
 //!      │                           │                                │
 //!      │ POST /v1/chat/completions │                                │
 //!      │ Authorization: Bearer     │                                │
@@ -13,7 +13,9 @@
 //!      │                           │ 2. лимит запросов              │
 //!      │                           │ 3. валидируем JSON и модель    │
 //!      │                           │ 4. меняем ключ на НАСТОЯЩИЙ    │
-//!      │                           ├───────────────────────────────>│
+//!      │                           ├───────────────────────────────>│ №1
+//!      │                           │    не отвечает / 5xx / 429?    │
+//!      │                           ├───────────────────────────────>│ №2
 //!      │                           │<───────────────────────────────┤
 //!      │<──────────────────────────┤ 5. отдаём ответ (в т.ч. SSE)   │
 //! ```
@@ -21,12 +23,17 @@
 //! Смысл: настоящий ключ провайдера знает только сервер. Клиенты получают
 //! отдельные «свои» ключи, которые можно отозвать, ограничить по модели и по частоте.
 //!
-//! Провайдеры:
-//! * основной (OpenAI-совместимый, платный) — `UPSTREAM_BASE_URL`;
-//! * локальная Ollama — `OLLAMA_BASE_URL` (по умолчанию включена на localhost).
+//! Доступ унифицирован: все провайдеры — равноправные записи списка
+//! `UPSTREAMS` (или старых переменных окружения), каждый общается по
+//! OpenAI-совместимому протоколу. Ollama — обычный провайдер без ключа,
+//! отдельных настроек не требует: по умолчанию она добавляется на
+//! `http://127.0.0.1:11434` как запасной провайдер.
 //!
-//! Модель с префиксом `ollama/…` в `/v1/chat/completions` маршрутизируется в
-//! Ollama (префикс срезается), всё остальное — к основному провайдеру.
+//! Маршрутизация моделей:
+//! * модель с префиксом `имя/` (например `ollama/llama3`) идёт ЗАДАННОМУ
+//!   провайдеру (префикс срезается), без failover;
+//! * модель без префикса идёт первому живому провайдеру по приоритету;
+//!   при недоступности / 5xx / 429 / 404 / 401 / 403 — следующему по списку.
 //! Помимо этого, целиком проксируются native-эндпоинты Ollama `/api/chat`,
 //! `/api/generate`, `/api/embeddings`, `/api/show`, `/api/tags`, `/api/version`.
 
@@ -45,7 +52,7 @@ use axum::{
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-use config::Config;
+use config::{Config, ProviderKind};
 use security::RateLimiter;
 
 /// Общее состояние приложения. Клонируется дёшево: всё тяжёлое — под `Arc`.
@@ -56,11 +63,10 @@ pub struct AppState {
     pub cfg: Arc<Config>,
     pub http: reqwest::Client,
     pub limiter: RateLimiter,
-    /// Слоты конкурентности к основному (платному) провайдеру.
-    pub slots: Arc<Semaphore>,
-    /// Отдельные слоты к Ollama: локальные модели грузятся в память,
-    /// у них свой (обычно меньший) предел параллелизма.
-    pub ollama_slots: Arc<Semaphore>,
+    /// Пул слотов конкурентности НА КАЖДОГО провайдера (индексы совпадают с
+    /// `cfg.providers`). Локальные модели Ollama грузятся в память, поэтому
+    /// им отдаём половину от основного лимита.
+    pub slots: Vec<Arc<Semaphore>>,
 }
 
 impl AppState {
@@ -78,18 +84,23 @@ impl AppState {
             .tcp_nodelay(true)
             .build()?;
 
-        // Ollama обычно держит столько же слотов, сколько моделей способна
-        // грузить одновременно; по умолчанию делим пополам от основного лимита.
-        let ollama_concurrency = cfg
-            .ollama
-            .as_ref()
-            .map(|_| (cfg.max_concurrent / 2).max(1))
-            .unwrap_or(1);
+        let slots = cfg
+            .providers
+            .iter()
+            .map(|p| {
+                let n = match p.kind {
+                    // Ollama обычно держит столько слотов, сколько моделей способна
+                    // грузить одновременно; делим пополам от основного лимита.
+                    ProviderKind::Ollama => (cfg.max_concurrent / 2).max(1),
+                    ProviderKind::OpenAi => cfg.max_concurrent,
+                };
+                Arc::new(Semaphore::new(n))
+            })
+            .collect();
 
         Ok(Self {
             limiter: RateLimiter::new(cfg.rate_per_minute),
-            slots: Arc::new(Semaphore::new(cfg.max_concurrent)),
-            ollama_slots: Arc::new(Semaphore::new(ollama_concurrency)),
+            slots,
             http,
             cfg,
         })
@@ -115,6 +126,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // Native-эндпоинты Ollama (лимит 1 МиБ: это текст, не изображения).
     // Путь строим сами и передаём константой — клиент не управляет URL.
+    // Запросы уходят первому провайдеру типа Ollama из общего списка.
     let ollama_routes = Router::new()
         .route("/api/chat", post(proxy::ollama_chat))
         .route("/api/generate", post(proxy::ollama_generate))
@@ -153,8 +165,9 @@ async fn api_root() -> Json<serde_json::Value> {
 }
 
 /// Ответ для GET /v1/models:
-/// allowlist из конфига + модели, установленные в Ollama (с префиксом ollama/).
-/// Список Ollama кешируется на короткое время, чтобы не дёргать её на каждый запрос.
+/// allowlist из конфига + модели каждого провайдера (с его префиксом `имя/`).
+/// Список запрашивается с коротким таймаутом: недоступный провайдер просто
+/// пропускается, эндпоинт не ломается.
 async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut models: Vec<serde_json::Value> = if state.cfg.allowed_models.is_empty() {
         // Если allowlist пуст — показываем заглушку
@@ -168,15 +181,15 @@ async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
             .collect()
     };
 
-    // Добавляем модели Ollama с её префиксом — клиент указывает их
-    // именно в таком виде в /v1/chat/completions.
-    if let Some(oc) = &state.cfg.ollama {
-        if let Some(tags) = proxy::ollama_model_list(&state, oc).await {
-            for name in tags {
+    // Добавляем модели каждого провайдера с его префиксом — клиент указывает
+    // их именно в таком виде в /v1/chat/completions.
+    for (i, p) in state.cfg.providers.iter().enumerate() {
+        if let Some(names) = proxy::provider_model_list(&state, i).await {
+            for name in names {
                 models.push(json!({
-                    "id": format!("{}{}", oc.model_prefix, name),
+                    "id": format!("{}{}", p.model_prefix, name),
                     "object": "model",
-                    "owned_by": "ollama"
+                    "owned_by": p.name
                 }));
             }
         }
@@ -196,12 +209,25 @@ async fn health() -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::{ProviderConfig, ProviderKind};
+
+    fn provider(name: &str, base: &str, kind: ProviderKind) -> ProviderConfig {
+        ProviderConfig {
+            name: name.into(),
+            base: reqwest::Url::parse(base).unwrap(),
+            api_key: Some("provider-key".into()),
+            kind,
+            model_prefix: format!("{name}/"),
+        }
+    }
 
     fn test_state() -> AppState {
         let cfg = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
-            upstream_base: reqwest::Url::parse("https://api.example.com/v1").unwrap(),
-            upstream_api_key: "k".into(),
+            providers: vec![
+                provider("openai", "https://api.example.com/v1", ProviderKind::OpenAi),
+                provider("ollama", "http://127.0.0.1:11434", ProviderKind::Ollama),
+            ],
             client_keys: vec!["client-key-aaaaaaaaaaaaaaaa".into()],
             allowed_models: std::collections::HashSet::new(),
             max_output_tokens: 100,
@@ -211,22 +237,22 @@ mod tests {
             idle_timeout: Duration::from_secs(10),
             python_bin: None,
             allow_http: false,
-            ollama: None,
         };
         AppState::new(Arc::new(cfg)).unwrap()
     }
 
     #[test]
-    fn router_builds_with_and_without_ollama() {
-        // без Ollama
-        let _r = build_router(test_state());
-        // с Ollama
-        let mut st = test_state();
-        Arc::get_mut(&mut st.cfg).unwrap().ollama = Some(config::OllamaConfig {
-            base: reqwest::Url::parse("http://127.0.0.1:11434").unwrap(),
-            api_key: None,
-            model_prefix: "ollama/".into(),
-        });
-        let _r2 = build_router(st);
+    fn router_builds_with_several_providers() {
+        let st = test_state();
+        // слоты выдаются на каждого провайдера
+        assert_eq!(st.slots.len(), 2);
+        let _r = build_router(st);
+    }
+
+    #[test]
+    fn ollama_slots_are_half_of_main_limit() {
+        let st = test_state();
+        assert_eq!(st.slots[1].available_permits(), 2); // 4 / 2
+        assert_eq!(st.slots[0].available_permits(), 4);
     }
 }

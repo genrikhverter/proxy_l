@@ -4,12 +4,35 @@
 //! Ничего не хардкодим, при ошибке конфигурации падаем сразу при старте (fail fast),
 //! а не в момент первого запроса пользователя.
 //!
-//! Провайдеров два:
-//! * основной — OpenAI-совместимый API (платный), `UPSTREAM_BASE_URL`;
-//! * локальная Ollama — `OLLAMA_BASE_URL` (по умолчанию `http://127.0.0.1:11434`).
+//! Провайдеры задаются СПИСКОМ С ПРИОРИТЕТОМ. Приоритет = порядок в списке:
+//! если провайдер не отвечает (сеть, таймаут, 5xx, 429, отвергнутый ключ),
+//! запрос автоматически уходит следующему по приоритету.
 //!
-//! Запросы к Ollama ходят по HTTP — это нормально для localhost. Для http к
-//! НЕ-loopback хостам включите `ALLOW_HTTP_UPSTREAM=1`.
+//! Два способа задать список:
+//!
+//! 1. `UPSTREAMS` — единая строка, записи через запятую, поля через `|`:
+//!
+//! ```text
+//! UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx, ollama|http://127.0.0.1:11434|, vllm|http://192.168.1.10:8000/v1|token"
+//! ```
+//!
+//! Формат записи: `имя|base_url[|api_key][|ollama]`.
+//! * пустой `api_key` (или пропущенное поле) = запрос без Authorization
+//!   (локальная Ollama так и работает — отдельные настройки ей не нужны);
+//! * провайдер с именем `ollama` (или с явным 4-м полем `ollama`) дополнительно
+//!   получает native-эндпоинты `/api/*` (NDJSON-стримы, `/api/tags`, ...);
+//! * модель с префиксом `имя/` (например `ollama/llama3`, `openai/gpt-4o`)
+//!   маршрутизируется к этому провайдеру явно, минуя приоритет;
+//! * запрос без префикса идёт первому живому провайдеру по порядку.
+//!
+//! 2. Обратная совместимость: старые переменные `UPSTREAM_BASE_URL` +
+//!    `UPSTREAM_API_KEY` задают провайдера `primary`, а Ollama включается
+//!    автоматически на `http://127.0.0.1:11434` (никаких `OLLAMA_*` указывать
+//!    не нужно; старые переменные `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`,
+//!    `OLLAMA_MODEL_PREFIX`, `OLLAMA_ENABLED=0` продолжают работать).
+//!
+//! Запросы к локальным провайдерам ходят по HTTP — это нормально для localhost.
+//! Для http к НЕ-loopback хостам включите `ALLOW_HTTP_UPSTREAM=1`.
 
 use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, time::Duration};
 
@@ -29,55 +52,92 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// Сколько байт тела ошибки провайдера мы читаем (и, возможно, отдаём клиенту).
 pub const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 
-/// Настройки локальной Ollama.
+/// Тип провайдера.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// OpenAI-совместимый API (`/v1/chat/completions`, `/v1/models`).
+    OpenAi,
+    /// Ollama: дополнительно к OpenAI-совместимому `/v1/...` умеет
+    /// native-эндпоинты `/api/*` (стрим NDJSON, `/api/tags`, ...).
+    Ollama,
+}
+
+/// Один провайдер из общего списка.
 ///
-/// Ollama одновременно умеет два API:
-/// * native (`/api/chat`, `/api/generate`, ...) — стримит NDJSON;
-/// * OpenAI-совместимый (`/v1/chat/completions`) — стримит SSE.
-/// Прокси умеет оба (см. `proxy.rs`).
+/// Все провайдеры унифицированы: прокси говорит с каждым по
+/// OpenAI-совместимому протоколу (`{base}/chat/completions`), разница только в
+/// `kind` (native `/api/*` у Ollama) и в наличии ключа. Локальная Ollama —
+/// обычный провайдер без ключа, никаких отдельных настроек не требуется.
 #[derive(Debug, Clone)]
-pub struct OllamaConfig {
-    /// Корневой URL Ollama БЕЗ `/v1` и без `/api/...`, например `http://127.0.0.1:11434`.
+pub struct ProviderConfig {
+    /// Короткое имя для логов и префикса моделей (`ollama/llama3`).
+    pub name: String,
+    /// Корневой URL провайдера. Для OpenAI-совместимых обычно с `/v1`
+    /// (например `https://api.openai.com/v1`), для Ollama — корень без `/v1`.
     pub base: Url,
-    /// Ключ, если Ollama закрыта авторизацией (`OLLAMA_API_KEY`).
-    /// Обычная локальная Ollama не требует ключа — тогда `None`.
+    /// Ключ провайдера. `None` = Authorization не отправляется вовсе
+    /// (локальная Ollama, открытый vLLM и т.п.).
     pub api_key: Option<String>,
-    /// Префикс моделей для маршрутизации из `/v1/chat/completions`:
-    /// запрос с моделью `ollama/llama3` уходит в Ollama как модель `llama3`.
-    /// Пустая строка = через /v1 в Ollama не маршрутизировать (только /api/...).
+    /// Тип протокола (влияет на native `/api/*` и `/v1/models`).
+    pub kind: ProviderKind,
+    /// Префикс моделей для явной маршрутизации из `/v1/chat/completions`:
+    /// запрос с моделью `ollama/llama3` уходит этому провайдеру как `llama3`.
+    /// По умолчанию `{имя}/`.
     pub model_prefix: String,
 }
 
-impl OllamaConfig {
-    /// URL native-эндпоинта: base + path (`/api/chat`, `/api/tags`, ...).
+impl ProviderConfig {
+    /// URL OpenAI-совместимого эндпоинта чата. У Ollama `/v1/...` живёт под
+    /// корнем (прокси добавляет `/v1` сам), у остальных `/v1` входит в base.
+    /// Путь строим САМИ из константы — клиент не управляет URL.
+    pub fn chat_completions_url(&self) -> Url {
+        match self.kind {
+            ProviderKind::Ollama => join_path(&self.base, "v1/chat/completions"),
+            ProviderKind::OpenAi => join_path(&self.base, "chat/completions"),
+        }
+    }
+
+    /// URL OpenAI-совместимого эндпоинта генерации изображений.
+    pub fn images_url(&self) -> Url {
+        match self.kind {
+            ProviderKind::Ollama => join_path(&self.base, "v1/images/generations"),
+            ProviderKind::OpenAi => join_path(&self.base, "images/generations"),
+        }
+    }
+
+    /// URL списка моделей: у Ollama native `/api/tags`, у остальных
+    /// OpenAI-совместимый `base + /models`.
+    pub fn models_url(&self) -> Url {
+        match self.kind {
+            ProviderKind::Ollama => join_path(&self.base, "api/tags"),
+            ProviderKind::OpenAi => join_path(&self.base, "models"),
+        }
+    }
+
+    /// URL native-эндпоинта: base + path (`/api/chat`, `/api/generate`, ...).
+    /// Имеет смысл только для `ProviderKind::Ollama`.
     /// Путь строим САМИ из константы — клиент не управляет URL.
     pub fn api_url(&self, path: &str) -> Url {
-        let mut url = self.base.clone();
-        let joined =
-            format!("{}/{}", url.path().trim_end_matches('/'), path.trim_start_matches('/'));
-        url.set_path(&joined);
-        url
+        join_path(&self.base, path)
     }
+}
 
-    /// URL OpenAI-совместимого эндпоинта чата Ollama.
-    pub fn chat_completions_url(&self) -> Url {
-        self.api_url("/v1/chat/completions")
-    }
-
-    /// URL списка установленных моделей.
-    pub fn tags_url(&self) -> Url {
-        self.api_url("/api/tags")
-    }
+/// Склеивает путь базового URL с относительным путём эндпоинта.
+fn join_path(base: &Url, path: &str) -> Url {
+    let mut url = base.clone();
+    let joined =
+        format!("{}/{}", url.path().trim_end_matches('/'), path.trim_start_matches('/'));
+    url.set_path(&joined);
+    url
 }
 
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Куда биндимся. По умолчанию только loopback — наружу открывать осознанно.
     pub listen: SocketAddr,
-    /// Базовый URL провайдера, например `https://api.openai.com/v1`.
-    pub upstream_base: Url,
-    /// НАСТОЯЩИЙ ключ провайдера. Живёт только здесь, клиенту не выдаётся никогда.
-    pub upstream_api_key: String,
+    /// Провайдеры В ПОРЯДКЕ ПРИОРИТЕТА: индекс 0 — самый приоритетный.
+    /// При недоступности одного запрос уходит следующему.
+    pub providers: Vec<ProviderConfig>,
     /// Ключи, которые мы выдаём своим клиентам (по одному на команду/сервис).
     pub client_keys: Vec<String>,
     /// Разрешённые модели (пишутся так, как их указывает клиент, включая префикс ollama/).
@@ -88,7 +148,8 @@ pub struct Config {
     pub max_output_tokens: u64,
     /// Лимит запросов на одного клиента в минуту (token bucket).
     pub rate_per_minute: u32,
-    /// Сколько запросов к провайдеру может выполняться одновременно.
+    /// Сколько запросов к ОДНОМУ провайдеру может выполняться одновременно
+    /// (у каждого провайдера свой пул слотов).
     pub max_concurrent: usize,
     /// Полный таймаут для обычных (не стриминговых) запросов.
     pub request_timeout: Duration,
@@ -102,11 +163,19 @@ pub struct Config {
     pub python_bin: Option<String>,
     /// Разрешить http:// к НЕ-loopback upstream-хостам (см. `ALLOW_HTTP_UPSTREAM`).
     pub allow_http: bool,
-    /// Настройки Ollama. `None` = Ollama выключена (`OLLAMA_ENABLED=0`).
-    pub ollama: Option<OllamaConfig>,
 }
 
 impl Config {
+    /// Первый в списке провайдер типа Ollama (для native-эндпоинтов `/api/*`).
+    pub fn ollama(&self) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|p| p.kind == ProviderKind::Ollama)
+    }
+
+    /// Индекс первого провайдера типа Ollama.
+    pub fn ollama_index(&self) -> Option<usize> {
+        self.providers.iter().position(|p| p.kind == ProviderKind::Ollama)
+    }
+
     pub fn from_env() -> Result<Self, String> {
         let listen = env::var("PROXY_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
         let listen: SocketAddr = listen.parse().map_err(|_| {
@@ -127,18 +196,22 @@ impl Config {
             ));
         }
 
-        let upstream_api_key = env::var("UPSTREAM_API_KEY").unwrap_or_default();
-        if upstream_api_key.trim().is_empty() {
-            return Err("UPSTREAM_API_KEY не задан".into());
-        }
-
         // http к чужим хостам — только осознанно: ключ/промпты уйдут по сети
         // открытым текстом. Для loopback http разрешён всегда.
         let allow_http = env_flag("ALLOW_HTTP_UPSTREAM");
 
-        let base =
-            env::var("UPSTREAM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        let upstream_base = validate_base_url(&base, allow_http)?;
+        // ---- Список провайдеров с приоритетами ----
+        let providers = match env::var("UPSTREAMS") {
+            Ok(spec) if !spec.trim().is_empty() => parse_upstreams(&spec, allow_http)?,
+            _ => legacy_providers(allow_http)?,
+        };
+        if providers.is_empty() {
+            return Err(
+                "не настроен ни один провайдер: задайте UPSTREAMS \
+                 (или UPSTREAM_BASE_URL + UPSTREAM_API_KEY)"
+                    .into(),
+            );
+        }
 
         let allowed_models: HashSet<String> =
             split_list(&env::var("ALLOWED_MODELS").unwrap_or_default())
@@ -168,45 +241,9 @@ impl Config {
             _ => None,
         };
 
-        // ---- Ollama: включена по умолчанию (ключей обычно нет, токены не платные) ----
-        let ollama = if env_flag_off_by_default("OLLAMA_ENABLED") {
-            let raw =
-                env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-            if raw.trim().is_empty() {
-                None // явное отключение пустым значением
-            } else {
-                let base = validate_base_url(&raw, allow_http)?;
-                // Частая ошибка: указать OpenAI-совместимый корень с /v1 — тогда
-                // native-пути склеились бы в /v1/api/chat. Отказываем сразу.
-                if base.path().trim_end_matches('/').ends_with("/v1") {
-                    return Err(
-                        "OLLAMA_BASE_URL: укажите КОРНЕВОЙ URL Ollama без /v1 \
-                         (например http://127.0.0.1:11434); \
-                         /v1/... и /api/... прокси добавит сам"
-                            .into(),
-                    );
-                }
-                let api_key = env::var("OLLAMA_API_KEY")
-                    .ok()
-                    .filter(|k| !k.trim().is_empty());
-                let model_prefix = env::var("OLLAMA_MODEL_PREFIX")
-                    .unwrap_or_else(|_| "ollama/".into())
-                    .trim()
-                    .to_string();
-                Some(OllamaConfig {
-                    base,
-                    api_key,
-                    model_prefix,
-                })
-            }
-        } else {
-            None
-        };
-
         Ok(Config {
             listen,
-            upstream_base,
-            upstream_api_key,
+            providers,
             client_keys,
             allowed_models,
             max_output_tokens,
@@ -216,18 +253,148 @@ impl Config {
             idle_timeout: Duration::from_secs(idle_secs),
             python_bin,
             allow_http,
-            ollama,
         })
     }
+}
 
-    /// Итоговый URL эндпоинта. Путь строим САМИ из константы:
-    /// клиент не управляет URL, значит невозможен SSRF и «открытый прокси».
-    pub fn chat_completions_url(&self) -> Url {
-        let mut url = self.upstream_base.clone();
-        let path = format!("{}/chat/completions", url.path().trim_end_matches('/'));
-        url.set_path(&path);
-        url
+/// Разбор `UPSTREAMS`: записи через запятую, поля через `|`.
+///
+/// Формат записи: `имя|base_url[|api_key][|ollama]`.
+/// Порядок записей = приоритет (первая запись — самый приоритетный провайдер).
+fn parse_upstreams(spec: &str, allow_http: bool) -> Result<Vec<ProviderConfig>, String> {
+    let mut out = Vec::new();
+
+    for (n, entry) in spec.split(',').map(str::trim).filter(|e| !e.is_empty()).enumerate() {
+        let where_ = format!("UPSTREAMS, запись №{}", n + 1);
+        let fields: Vec<&str> = entry.split('|').map(str::trim).collect();
+        if fields.len() < 2 || fields.len() > 4 {
+            return Err(format!(
+                "{where_}: ожидается формат имя|base_url[|api_key][|ollama], получено «{entry}»"
+            ));
+        }
+
+        let name = fields[0];
+        if name.is_empty()
+            || name.len() > 32
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "{where_}: имя провайдера «{name}» некорректно — нужны строчные латинские \
+                 буквы, цифры, «-» или «_», не длиннее 32 символов"
+            ));
+        }
+        if out.iter().any(|p: &ProviderConfig| p.name == name) {
+            return Err(format!("{where_}: провайдер «{name}» указан дважды"));
+        }
+
+        let base = validate_base_url(fields[1], allow_http)
+            .map_err(|e| format!("{where_} (провайдер «{name}»): {e}"))?;
+
+        // Тип: явное 4-е поле `ollama` или имя провайдера `ollama`.
+        let kind = match fields.get(3) {
+            None => {
+                if name == "ollama" {
+                    ProviderKind::Ollama
+                } else {
+                    ProviderKind::OpenAi
+                }
+            }
+            Some(&"ollama") => ProviderKind::Ollama,
+            Some(other) => {
+                return Err(format!(
+                    "{where_} (провайдер «{name}»): неизвестный тип «{other}», \
+                     допустимо только «ollama»"
+                ))
+            }
+        };
+
+        // Ollama-провайдер — это корень без /v1 (native-пути /api/... клеятся к нему).
+        // Частая ошибка: указать OpenAI-совместимый корень с /v1 — тогда получилось
+        // бы /v1/api/chat. Отказываем сразу.
+        if kind == ProviderKind::Ollama && base.path().trim_end_matches('/').ends_with("/v1") {
+            return Err(format!(
+                "{where_} (провайдер «{name}»): укажите КОРНЕВОЙ URL Ollama без /v1 \
+                 (например http://127.0.0.1:11434); \
+                 /v1/... и /api/... прокси добавит сам"
+            ));
+        }
+
+        // Пустой ключ или пропущенное поле = запрос без Authorization.
+        let api_key = fields.get(2).filter(|k| !k.is_empty()).map(|s| s.to_string());
+
+        out.push(ProviderConfig {
+            name: name.to_string(),
+            base,
+            api_key,
+            kind,
+            model_prefix: format!("{name}/"),
+        });
     }
+
+    Ok(out)
+}
+
+/// Обратная совместимость: конфигурация из старых переменных окружения.
+///
+/// `UPSTREAM_BASE_URL` + `UPSTREAM_API_KEY` → провайдер `primary`;
+/// Ollama включается АВТОМАТИЧЕСКИ на `http://127.0.0.1:11434` без всяких
+/// настроек — как наименее приоритетный (запасной) провайдер.
+fn legacy_providers(allow_http: bool) -> Result<Vec<ProviderConfig>, String> {
+    let upstream_api_key = env::var("UPSTREAM_API_KEY").unwrap_or_default();
+    if upstream_api_key.trim().is_empty() {
+        return Err(
+            "UPSTREAM_API_KEY не задан. Задайте его вместе с UPSTREAM_BASE_URL \
+             или перечислите провайдеров в UPSTREAMS"
+                .into(),
+        );
+    }
+
+    let base = env::var("UPSTREAM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let primary = ProviderConfig {
+        name: "primary".into(),
+        base: validate_base_url(&base, allow_http)?,
+        api_key: Some(upstream_api_key),
+        kind: ProviderKind::OpenAi,
+        model_prefix: "primary/".into(),
+    };
+
+    let mut providers = vec![primary];
+
+    // ---- Ollama: включена по умолчанию (обычно ключей нет, токены не платные).
+    // Отдельных настроек не требует: дефолтный URL localhost подходит всем.
+    if env_flag_off_by_default("OLLAMA_ENABLED") {
+        let raw =
+            env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        if raw.trim().is_empty() {
+            // явное отключение пустым значением
+        } else {
+            let base = validate_base_url(&raw, allow_http)?;
+            if base.path().trim_end_matches('/').ends_with("/v1") {
+                return Err(
+                    "OLLAMA_BASE_URL: укажите КОРНЕВОЙ URL Ollama без /v1 \
+                     (например http://127.0.0.1:11434); \
+                     /v1/... и /api/... прокси добавит сам"
+                        .into(),
+                );
+            }
+            let api_key = env::var("OLLAMA_API_KEY").ok().filter(|k| !k.trim().is_empty());
+            let model_prefix = env::var("OLLAMA_MODEL_PREFIX")
+                .unwrap_or_else(|_| "ollama/".into())
+                .trim()
+                .to_string();
+            providers.push(ProviderConfig {
+                name: "ollama".into(),
+                base,
+                api_key,
+                kind: ProviderKind::Ollama,
+                model_prefix,
+            });
+        }
+    }
+
+    Ok(providers)
 }
 
 /// Переменная-флаг: «1», «true», «yes», «on» (в любом регистре) = true, остальное = false.
@@ -344,31 +511,124 @@ mod tests {
         assert!(validate_base_url("not an url", false).is_err());
     }
 
-    fn ollama_cfg() -> OllamaConfig {
-        OllamaConfig {
+    #[test]
+    fn provider_urls_are_built_by_us() {
+        let p = ProviderConfig {
+            name: "openai".into(),
+            base: validate_base_url("https://api.openai.com/v1/", false).unwrap(),
+            api_key: Some("k".into()),
+            kind: ProviderKind::OpenAi,
+            model_prefix: "openai/".into(),
+        };
+        assert_eq!(
+            p.chat_completions_url().as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            p.images_url().as_str(),
+            "https://api.openai.com/v1/images/generations"
+        );
+        assert_eq!(p.models_url().as_str(), "https://api.openai.com/v1/models");
+
+        let o = ProviderConfig {
+            name: "ollama".into(),
             base: validate_base_url("http://127.0.0.1:11434", false).unwrap(),
             api_key: None,
+            kind: ProviderKind::Ollama,
             model_prefix: "ollama/".into(),
-        }
+        };
+        assert_eq!(
+            o.chat_completions_url().as_str(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(o.api_url("/api/chat").as_str(), "http://127.0.0.1:11434/api/chat");
+        assert_eq!(o.api_url("api/generate").as_str(), "http://127.0.0.1:11434/api/generate");
+        assert_eq!(o.models_url().as_str(), "http://127.0.0.1:11434/api/tags");
+    }
+
+    // ---- разбор UPSTREAMS ----
+
+    #[test]
+    fn upstreams_parsed_in_priority_order() {
+        let spec = "openai|https://api.openai.com/v1|sk-xxx, \
+                    vllm|http://192.168.1.10:8000/v1|token, \
+                    ollama|http://127.0.0.1:11434|";
+        let ps = parse_upstreams(spec, true).unwrap();
+        assert_eq!(ps.len(), 3);
+        // порядок = приоритет
+        assert_eq!(ps[0].name, "openai");
+        assert_eq!(ps[1].name, "vllm");
+        assert_eq!(ps[2].name, "ollama");
+        // ключи и типы
+        assert_eq!(ps[0].api_key.as_deref(), Some("sk-xxx"));
+        assert_eq!(ps[0].kind, ProviderKind::OpenAi);
+        assert_eq!(ps[1].api_key.as_deref(), Some("token"));
+        assert_eq!(ps[2].api_key, None, "пустой ключ = без Authorization");
+        assert_eq!(ps[2].kind, ProviderKind::Ollama, "имя ollama задаёт тип");
+        // префиксы по имени
+        assert_eq!(ps[0].model_prefix, "openai/");
+        assert_eq!(ps[2].model_prefix, "ollama/");
     }
 
     #[test]
-    fn ollama_urls_are_built_by_us() {
-        let oc = ollama_cfg();
-        assert_eq!(oc.api_url("/api/chat").as_str(), "http://127.0.0.1:11434/api/chat");
-        assert_eq!(oc.api_url("api/generate").as_str(), "http://127.0.0.1:11434/api/generate");
-        assert_eq!(
-            oc.chat_completions_url().as_str(),
-            "http://127.0.0.1:11434/v1/chat/completions"
-        );
-        assert_eq!(oc.tags_url().as_str(), "http://127.0.0.1:11434/api/tags");
+    fn upstreams_explicit_ollama_kind_and_empty_key() {
+        let ps =
+            parse_upstreams("local|http://127.0.0.1:11434||ollama", false).unwrap();
+        assert_eq!(ps[0].name, "local");
+        assert_eq!(ps[0].kind, ProviderKind::Ollama);
+        assert_eq!(ps[0].api_key, None);
+        assert_eq!(ps[0].model_prefix, "local/");
     }
 
-    fn cfg_fixture() -> Config {
-        Config {
+    #[test]
+    fn upstreams_two_fields_ok() {
+        let ps = parse_upstreams("ollama|http://127.0.0.1:11434", false).unwrap();
+        assert_eq!(ps.len(), 1);
+        assert_eq!(ps[0].api_key, None);
+        assert_eq!(ps[0].kind, ProviderKind::Ollama);
+    }
+
+    #[test]
+    fn upstreams_bad_entries_rejected() {
+        // нет URL
+        assert!(parse_upstreams("openai", false).is_err());
+        // слишком много полей
+        assert!(parse_upstreams("a|http://x|k|ollama|extra", false).is_err());
+        // плохое имя
+        assert!(parse_upstreams("Bad Name|https://x/v1|k", false).is_err());
+        assert!(parse_upstreams("|https://x/v1|k", false).is_err());
+        // дубликат имени
+        assert!(parse_upstreams("a|https://x/v1|k, a|https://y/v1|k", false).is_err());
+        // неизвестный тип
+        assert!(parse_upstreams("a|https://x/v1|k|foo", false).is_err());
+        // ollama с /v1 в корне
+        assert!(parse_upstreams("ollama|http://127.0.0.1:11434/v1|", false).is_err());
+        // http на чужой хост без флага
+        assert!(parse_upstreams("a|http://192.168.1.10:8000/v1|k", false).is_err());
+        // пустая строка → пустой список (ошибка отдаётся выше, в from_env)
+        assert!(parse_upstreams(" , ,", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_ollama_helpers_find_first_ollama() {
+        let cfg = Config {
             listen: "127.0.0.1:8080".parse().unwrap(),
-            upstream_base: validate_base_url("https://api.example.com/v1", false).unwrap(),
-            upstream_api_key: "k".into(),
+            providers: vec![
+                ProviderConfig {
+                    name: "openai".into(),
+                    base: validate_base_url("https://api.openai.com/v1", false).unwrap(),
+                    api_key: Some("k".into()),
+                    kind: ProviderKind::OpenAi,
+                    model_prefix: "openai/".into(),
+                },
+                ProviderConfig {
+                    name: "ollama".into(),
+                    base: validate_base_url("http://127.0.0.1:11434", false).unwrap(),
+                    api_key: None,
+                    kind: ProviderKind::Ollama,
+                    model_prefix: "ollama/".into(),
+                },
+            ],
             client_keys: vec!["c".into()],
             allowed_models: HashSet::new(),
             max_output_tokens: 100,
@@ -378,16 +638,8 @@ mod tests {
             idle_timeout: Duration::from_secs(10),
             python_bin: None,
             allow_http: false,
-            ollama: None,
-        }
-    }
-
-    #[test]
-    fn endpoint_path_is_built_by_us() {
-        let cfg = cfg_fixture();
-        assert_eq!(
-            cfg.chat_completions_url().as_str(),
-            "https://api.example.com/v1/chat/completions"
-        );
+        };
+        assert_eq!(cfg.ollama().unwrap().name, "ollama");
+        assert_eq!(cfg.ollama_index(), Some(1));
     }
 }
