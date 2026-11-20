@@ -1,55 +1,62 @@
+# LLM Proxy — «Безопасный» шлюз к LLM-провайдерам с приоритетным failover
 
-
-# LLM Proxy — "Безопасный" шлюз к LLM-провайдерам
-
-Высокопроизводительный HTTP-прокси для OpenAI-совместимых API (OpenAI, OpenRouter, GenOffice, vLLM и др.). written in Rust.
+Высокопроизводительный HTTP-прокси для OpenAI-совместимых API (OpenAI, OpenRouter, Timeweb, cloud.ru, vLLM и др.), написанный на Rust.
 
 ## ✨ Ключевые возможности
 
-- **Безопасность ключей**: Настоящий ключ провайдера (`UPSTREAM_API_KEY`) никогда не покидает сервер. Клиенты используют отдельные ключи с constant-time проверкой (защита от timing-атак).
-- **Выполнение кода из промптов**: Автоматический поиск блоков `` ```python `` в сообщениях, выполнение через внешний интерпретатор и подстановка результата обратно в промпт **до** отправки провайдеру.
+- **Несколько провайдеров с приоритетами и failover**: провайдеры задаются списком `UPSTREAMS`, порядок = приоритет. Если провайдер не отвечает (сеть, таймаут, 401/403/404/408/429/5xx), тот же запрос автоматически уходит следующему по приоритету.
+- **Унифицированный доступ**: все провайдеры — равноправные записи одного списка, каждый общается по OpenAI-совместимому протоколу. Ollama — обычный провайдер без ключа: отдельные настройки ей не нужны, по умолчанию она включается на `http://127.0.0.1:11434` как запасной провайдер.
+- **Безопасность ключей**: настоящий ключ каждого провайдера никогда не покидает сервер. Клиенты используют отдельные ключи с constant-time проверкой (защита от timing-атак).
+- **Выполнение кода из промптов**: автоматический поиск блоков `` ```python `` в сообщениях, выполнение через внешний интерпретатор и подстановка результата обратно в промпт **до** отправки провайдеру.
 - **Защита от злоупотреблений**:
-  - Token Bucket Rate Limiter на каждого клиента
-  - Семафор конкурентности (честный backpressure, 503 при перегрузке)
-  - Лимиты на размер тела запроса/ответа
-  - Allowlist моделей
-  - Clamp `max_tokens` / `max_completion_tokens`
-- **Стриминг (SSE)**: Корректная поддержка с backpressure через ограниченный канал. Медленный клиент тормозит чтение у провайдера, память не растёт.
-- **Безопасность сети**: Отключены редиректы (защита от SSRF и утечки токенов), валидация Base URL, разделение таймаутов для стримов и обычных запросов.
-- **Graceful Shutdown**: Корректное завершение активных стримов при SIGTERM/Ctrl-C.
-- **Fail-fast конфигурация**: Прокси не запустится с некорректными настройками.
+  - Token Bucket Rate Limiter на каждого клиента;
+  - семафор конкурентности **на каждого провайдера** (честный backpressure, 503 при перегрузке);
+  - лимиты на размер тела запроса/ответа;
+  - allowlist моделей;
+  - clamp `max_tokens` / `max_completion_tokens`.
+- **Стриминг (SSE и NDJSON)**: корректная поддержка с backpressure через ограниченный канал. Медленный клиент тормозит чтение у провайдера, память не растёт. Слот конкурентности живёт до конца стрима.
+- **Безопасность сети**: отключены редиректы (защита от SSRF и утечки токенов), валидация Base URL, заголовки собираются с нуля («белый список») — Authorization клиента, Cookie и Host не утекают наружу.
+- **Graceful Shutdown**: корректное завершение активных стримов при SIGTERM/Ctrl-C.
+- **Fail-fast конфигурация**: прокси не запустится с некорректными настройками (плохой URL, дубликаты имён, ключи короче 16 символов).
 
+## 🔀 Маршрутизация и failover
 
+### Правила маршрутизации
 
- **Полноценная работа с Ollama** — два способа одновременно:
-   * маршрутизация из `/v1/chat/completions`: модель с префиксом `ollama/`
-     (например `ollama/llama3`) уходит в Ollama, префикс срезается;
-   * native-эндпоинты Ollama проксируются целиком: `POST /api/chat`,
-     `POST /api/generate`, `POST /api/embeddings`, `POST /api/show`,
-     `GET /api/tags`, `GET /api/version`.
-   NDJSON-стрим Ollama (`"stream": true`) проксируется с тем же backpressure,
-     что и SSE: слот конкурентности живёт до конца стрима, медленный клиент
-     тормозит чтение, память не растёт.
-   `/v1/models` теперь показывает и модели, установленные в Ollama
-     (`ollama/llama3`, `ollama/qwen2.5`, ...).
-   У Ollama свой пул слотов конкурентности (`MAX_CONCURRENT / 2`): тяжёлая
-     локальная модель не выедает слоты платного API.
-   Allowlist моделей проверяется по полному имени (`ollama/llama3`); для
-     native-запросов `/api/*` принимается и «голое» имя (`llama3`).
+1. **Модель с префиксом `имя/`** (`timeweb/gpt-4o`, `ollama/llama3`) уходит **заданному** провайдеру — префикс срезается, failover не выполняется.
+2. **Модель без префикса** идёт **первому живому провайдеру по приоритету**.
 
+### Когда запрос уходит следующему провайдеру
 
+| Условие | Пример | Повтор у следующего? |
+|---|---|---|
+| Ошибка соединения / таймаут | провайдер выключен | ✅ да |
+| HTTP 401 / 403 | у провайдера протух наш ключ | ✅ да |
+| HTTP 404 | модель не установлена | ✅ да |
+| HTTP 408 / 429 | таймаут / квота исчерпана | ✅ да |
+| HTTP 5xx | авария на стороне провайдера | ✅ да |
+| Прочие 4xx (400, 413, 422...) | ошибка в самом запросе | ❌ нет — отдаётся клиенту как есть |
 
+Если ни один провайдер не ответил — клиент получает `502` с числом попыток; если все слоты заняты — `503 Busy`.
 
+### Полезные следствия
+
+- **Экономия**: поставьте бесплатную Ollama первым — лёгкий трафик идёт бесплатно, платный API берёт на себя только то, чего нет в Ollama (или когда она выключена).
+- **Отказоустойчивость**: выключение любого провайдера не ломает сервис — запрос переезжает к следующему.
+- Провайдер без поддержки Images API (например, Ollama) вернёт 404/501, и запрос генерации изображений уйдёт следующему — failover работает и для `/v1/images/generations`.
 
 ## 📁 Структура проекта
 
 ```
 src/
-├── main.rs       # Точка входа, graceful shutdown
-├── lib.rs        # AppState, роутер, health-check
-├── config.rs     # Конфигурация из ENV, валидация URL
+├── main.rs       # Точка входа, логирование провайдеров, graceful shutdown
+├── lib.rs        # AppState (пул слотов на провайдера), роутер, /v1/models
+├── config.rs     # UPSTREAMS/ENV, ProviderConfig, валидация URL
 ├── security.rs   # Аутентификация, rate limiter
-└── proxy.rs      # Обработка запросов, санитизация, выполнение Python-кода
+└── proxy.rs      # dispatch с failover, санитизация, выполнение Python-кода
+tests/
+└── failover.rs   # Интеграционные тесты failover на живых mock-серверах
+start.sh          # Пример запуска (бесплатный провайдер → платные)
 ```
 
 ## 🚀 Быстрый старт
@@ -59,79 +66,44 @@ src/
 - Rust 1.85+
 - Python 3.x (если используется выполнение кода)
 
-### 2. Сборка
+### 2. Сборка и запуск
 
 ```bash
-# Для разработки
-cargo build
-
-# Для продакшена
 cargo build --release
+./start.sh   # или экспортируйте переменные вручную и запустите ./llm-proxy
 ```
 
 ### 3. Настройка переменных окружения
 
-Создайте файл `.env` или экспортируйте переменные:
-
 ```bash
 # === ОБЯЗАТЕЛЬНЫЕ ===
 
-# Ключи клиентов (через запятую, минимум 16 символов каждый)
+# Ключи клиентов (через запятую, минимум 16 символов каждый!)
 # Генерация: openssl rand -hex 32
 export PROXY_API_KEYS="client-key-aaaaaaaaaaaaaaaa,client-key-bbbbbbbbbbbbbbbb"
 
-# Настоящий ключ провайдера (никогда не передаётся клиентам)
-export UPSTREAM_API_KEY="sk-your-real-provider-key"
+# Провайдеры по приоритету: первая запись обрабатывает запрос первой
+export UPSTREAMS="ollama|http://127.0.0.1:11434|, openai|https://api.openai.com/v1|sk-xxx"
 
 # === ОПЦИОНАЛЬНЫЕ ===
-
-# Адрес прослушивания (по умолчанию только loopback)
 export PROXY_LISTEN="127.0.0.1:8080"
-
-# Базовый URL провайдера (без /chat/completions!)
-export UPSTREAM_BASE_URL="https://api.openai.com/v1"
-
-# Разрешённые модели (пустое = все разрешены — ОПАСНО!)
-export ALLOWED_MODELS="gpt-4o-mini,gpt-4o,claude-3.5-sonnet"
-
-# Потолок выходных токенов
+export ALLOWED_MODELS="gpt-4o-mini,ollama/llama3"
 export MAX_OUTPUT_TOKENS=4096
-
-# Лимит запросов на клиента в минуту
 export RATE_LIMIT_PER_MIN=60
-
-# Максимум одновременных запросов к провайдеру
 export MAX_CONCURRENT=32
-
-# Таймауты (секунды, диапазон 1–600)
 export REQUEST_TIMEOUT_SECS=120
 export UPSTREAM_IDLE_TIMEOUT_SECS=120
-
-# === ВЫПОЛНЕНИЕ PYTHON-КОДА ===
-
-# Путь к интерпретатору Python. Если не задан — блоки ```python пропускаются.
-# ⚠️ В продакшене используйте изолированный интерпретатор!
-export PYTHON_BIN="/usr/bin/python3"
+export PYTHON_BIN="/usr/bin/python3"     # пусто = python-блоки не выполняются
 ```
 
-### 4. Запуск
-
-```bash
-# Разработка
-cargo run
-
-# Продакшен
-./target/release/llm-proxy
-```
-
-### 5. Проверка
+### 4. Проверка
 
 ```bash
 # Health-check
 curl http://127.0.0.1:8080/health
 # {"status":"ok"}
 
-# Обычный запрос
+# Обычный запрос — уйдёт первому живому провайдеру по приоритету
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa" \
   -H "Content-Type: application/json" \
@@ -140,6 +112,21 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
     "messages": [{"role": "user", "content": "Привет!"}],
     "max_tokens": 50
   }'
+
+# Модель с префиксом — уйдёт ЗАДАННОМУ провайдеру (ollama), префикс срезается
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}'
+
+# Список моделей: allowlist + модели каждого провайдера с его префиксом
+curl http://127.0.0.1:8080/v1/models -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa"
+
+# Native Ollama API со стримом (NDJSON)
+curl -N http://127.0.0.1:8080/api/chat \
+  -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 # Запрос с выполнением Python-кода
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
@@ -156,11 +143,104 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
 # "Вычисли факториал 10:\n\n```\n3628800\n```"
 ```
 
+## 🔧 Подключение провайдеров (UPSTREAMS)
+
+Формат: записи через запятую, поля через `|`.
+
+```
+UPSTREAMS="имя|base_url[|api_key][|ollama], ..."
+```
+
+| Поле | Значение |
+|---|---|
+| `имя` | строчные латинские буквы/цифры/`-`/`_`, ≤ 32 символов, уникально. Используется в логах и как префикс моделей `{имя}/` |
+| `base_url` | OpenAI-совместимые — **с `/v1`**; Ollama — **корень без `/v1`** |
+| `api_key` | ключ провайдера; пустое поле или пропущено = запрос **без** Authorization |
+| `ollama` | необязательное 4-е поле: провайдер с native-эндпоинтами `/api/*`; провайдер с именем `ollama` получает этот тип автоматически |
+
+### Примеры base_url
+
+```bash
+# OpenAI
+export UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx"
+# OpenRouter
+export UPSTREAMS="openrouter|https://openrouter.ai/api/v1|sk-or-v1-..."
+# Timeweb Cloud
+export UPSTREAMS="timeweb|https://api.timeweb.ai/v1|sk-..."
+# cloud.ru Foundation Models
+export UPSTREAMS="cloudru|https://foundation-models.api.cloud.ru/v1|token"
+# Локальный vLLM (без ключа — запрос пойдёт без Authorization)
+export UPSTREAMS="vllm|http://127.0.0.1:8000/v1|"
+# Ollama (тип ollama задаётся именем или 4-м полем)
+export UPSTREAMS="ollama|http://127.0.0.1:11434|"
+export UPSTREAMS="local|http://192.168.1.10:11434||ollama"
+```
+
+### Цепочка «бесплатный → платные» (см. start.sh)
+
+```bash
+export UPSTREAMS="ollama|http://172.16.162.33:11434|, \
+  timeweb|https://api.timeweb.ai/v1|sk-..., \
+  openrouter|https://openrouter.ai/api/v1|sk-or-v1-..., \
+  cloudru|https://foundation-models.api.cloud.ru/v1|token"
+export ALLOW_HTTP_UPSTREAM=1   # нужен для http к НЕ-loopback хостам (Ollama в LAN)
+```
+
+### Обратная совместимость
+
+Старые переменные продолжают работать, если `UPSTREAMS` не задан: `UPSTREAM_BASE_URL` + `UPSTREAM_API_KEY` создают провайдера `primary`, а Ollama **автоматически** включается на `http://127.0.0.1:11434` как запасной провайдер — `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL_PREFIX`, `OLLAMA_ENABLED=0` поддерживаются, но требуются только для нестандартных установок.
+
+## 🦙 Полноценная работа с Ollama
+
+Ollama — обычный провайдер в общем списке (`kind = ollama`), но с двумя особенностями:
+
+- **Native-эндпоинты проксируются целиком** (на первого провайдера типа ollama): `POST /api/chat`, `POST /api/generate`, `POST /api/embeddings`, `POST /api/show`, `GET /api/tags`, `GET /api/version`. NDJSON-стрим (`"stream": true`) проксируется с тем же backpressure, что и SSE: слот конкурентности живёт до конца стрима, медленный клиент тормозит чтение, память не растёт.
+- **Allowlist моделей** проверяется по полному имени (`ollama/llama3`); для native-запросов `/api/*` принимается и «голое» имя (`llama3`), и имя с префиксом.
+
+У Ollama свой пул слотов конкурентности (`MAX_CONCURRENT / 2`): тяжёлая локальная модель не выедает слоты платного API.
+
+## 🏗️ Архитектура обработки запроса
+
+```
+Клиент → [Auth] → [Rate Limit] → [Parse JSON] → [Sanitize + Python Exec]
+       → [Clamp max_tokens] → [Кандидаты: префикс → 1 провайдер | весь список]
+       → [Acquire Slot провайдера] → [Upstream Request]
+       →   не отвечает / 401/403/404/408/429/5xx → следующий по приоритету
+       → [Stream / Read Response] → Клиент
+```
+
+Порядок проверок оптимизирован: дешёвые проверки (ключ, лимит, JSON) выполняются **до** дорогого сетевого запроса. Мусорный трафик не доходит ни до одного провайдера. Ключ провайдера подставляется только в момент отправки — свой для каждого.
+
+## 📊 Переменные окружения (полная таблица)
+
+| Переменная | Обязательна | По умолчанию | Описание |
+|-----------|:-----------:|-------------|----------|
+| `PROXY_API_KEYS` | ✅ | — | Ключи клиентов через запятую (≥16 симв. каждый) |
+| `UPSTREAMS` | ✅* | — | Провайдеры по приоритету: `имя\|base_url[\|ключ][\|ollama], ...` |
+| `UPSTREAM_API_KEY` | ✅* | — | Ключ провайдера (старый способ) |
+| `UPSTREAM_BASE_URL` | | `https://api.openai.com/v1` | Base URL провайдера (старый способ) |
+| `PROXY_LISTEN` | | `127.0.0.1:8080` | Адрес прослушивания |
+| `ALLOWED_MODELS` | | *(все)* | Разрешённые модели через запятую, с префиксами |
+| `MAX_OUTPUT_TOKENS` | | `4096` | Потолок max_tokens/max_completion_tokens/num_predict |
+| `RATE_LIMIT_PER_MIN` | | `60` | Лимит запросов/мин на клиента |
+| `MAX_CONCURRENT` | | `32` | Макс одновременных запросов к одному провайдеру |
+| `REQUEST_TIMEOUT_SECS` | | `120` | Таймаут нестриминговых запросов (1–600) |
+| `UPSTREAM_IDLE_TIMEOUT_SECS` | | `120` | Idle-таймаут стримов (1–600) |
+| `PYTHON_BIN` | | *(нет)* | Путь к Python-интерпретатору |
+| `ALLOW_HTTP_UPSTREAM` | | `0` | Разрешить http:// к НЕ-loopback upstream'ам |
+| `OLLAMA_ENABLED` | | `1` | `0` — выключить авто-Ollama (только старый способ) |
+| `OLLAMA_BASE_URL` | | `http://127.0.0.1:11434` | Корневой URL Ollama БЕЗ `/v1` (старый способ) |
+| `OLLAMA_API_KEY` | | *(нет)* | Ключ, если Ollama за авторизацией (старый способ) |
+| `OLLAMA_MODEL_PREFIX` | | `ollama/` | Префикс маршрутизации (старый способ) |
+| `RUST_LOG` | | `info` | Уровень логирования (trace/debug/info/warn/error) |
+
+\* Обязателен `UPSTREAMS` **или** пара `UPSTREAM_API_KEY` + `UPSTREAM_BASE_URL` (старый способ). Хотя бы один провайдер должен быть настроен.
+
 ## 🐍 Выполнение Python-кода из промптов
 
 ### Как это работает
 
-1. Клиент отправляет запрос с блоками `` ```python ... ``` `` в поле `content` сообщений.
+1. Клиент отправляет запрос с блоками `` ```python ... ``` `` в поле `content` сообщений (и в `prompt` для `/api/generate`).
 2. Прокси **до отправки провайдеру** находит все такие блоки.
 3. Каждый блок выполняется через `PYTHON_BIN -c "<код>"`.
 4. Блок заменяется на вывод интерпретатора в обычном code-fence: `` ```\n<вывод>\n``` ``.
@@ -179,15 +259,10 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
 
 **НИКОГДА не запускайте `PYTHON_BIN=/usr/bin/python3` в продакшене без изоляции.** Клиенты могут выполнить произвольный код на вашем сервере.
 
-Рекомендуемые варианты изоляции:
-
 ```bash
-# Вариант 1: Docker (рекомендуется)
+# Вариант 1: Docker (рекомендуется) — скрипт docker-python-sandbox:
+# docker run --rm --network none --read-only --memory 256m --cpus 0.5 python:3.12-slim python "$@"
 export PYTHON_BIN="/usr/local/bin/docker-python-sandbox"
-# где docker-python-sandbox — скрипт:
-# docker run --rm --network none --read-only \
-#   --memory 256m --cpus 0.5 \
-#   python:3.12-slim python -c "$@"
 
 # Вариант 2: nsjail
 export PYTHON_BIN="/usr/local/bin/nsjail-python"
@@ -206,131 +281,28 @@ export PYTHON_BIN="/usr/local/bin/bwrap-python"
 | Не удалось запустить | `` ```\n[SPAWN ERROR] ...\n``` `` |
 | `PYTHON_BIN` не задан | Блоки `` ```python `` остаются без изменений |
 
-## 🔧 Подключение разных провайдеров
-
-Прокси совместим с любым OpenAI-совместимым API. Меняйте только `UPSTREAM_BASE_URL` и `UPSTREAM_API_KEY`:
-
-```bash
-# OpenAI
-export UPSTREAM_BASE_URL="https://api.openai.com/v1"
-
-# OpenRouter
-export UPSTREAM_BASE_URL="https://openrouter.ai/api/v1"
-
-# GenOffice / корпоративный шлюз
-export UPSTREAM_BASE_URL="https://genoffice.company.com/v1"
-
-# Локальный vLLM / Ollama
-export UPSTREAM_BASE_URL="http://127.0.0.1:8000/v1"
-```
-
-> **Важно:** URL должен заканчиваться на `/v1`, а не на `/v1/chat/completions`. Прокси сам добавляет путь эндпоинта.
-
-## 🏗️ Архитектура обработки запроса
-
-```
-Клиент → [Auth] → [Rate Limit] → [Parse JSON] → [Sanitize + Python Exec]
-       → [Clamp max_tokens] → [Acquire Slot] → [Upstream Request]
-       → [Stream / Read Response] → Клиент
-```
-
-Порядок проверок оптимизирован: дешёвые проверки (ключ, лимит, JSON) выполняются **до** дорогого сетевого запроса. Мусорный трафик не доходит до платного API.
-
-## 📊 Переменные окружения (полная таблица)
-
-| Переменная | Обязательна | По умолчанию | Описание |
-|-----------|:-----------:|-------------|----------|
-| `PROXY_API_KEYS` | ✅ | — | Ключи клиентов через запятую (≥16 симв.) |
-| `UPSTREAM_API_KEY` | ✅ | — | Ключ провайдера |
-| `PROXY_LISTEN` | | `127.0.0.1:8080` | Адрес прослушивания |
-| `UPSTREAM_BASE_URL` | | `https://api.openai.com/v1` | Base URL провайдера |
-| `ALLOWED_MODELS` | | *(все)* | Разрешённые модели через запятую |
-| `MAX_OUTPUT_TOKENS` | | `4096` | Потолок max_tokens/max_completion_tokens |
-| `RATE_LIMIT_PER_MIN` | | `60` | Лимит запросов/мин на клиента |
-| `MAX_CONCURRENT` | | `32` | Макс одновременных запросов к провайдеру |
-| `REQUEST_TIMEOUT_SECS` | | `120` | Таймаут нестриминговых запросов (1–600) |
-| `UPSTREAM_IDLE_TIMEOUT_SECS` | | `120` | Idle-таймаут стримов (1–600) |
-| `PYTHON_BIN` | | *(нет)* | Путь к Python-интерпретатору |
-| `RUST_LOG` | | `info` | Уровень логирования (trace/debug/info/warn/error) |
-
 ## 🧪 Тесты
 
 ```bash
-cargo test
+cargo test                  # 37 юнит-тестов + 5 интеграционных
+cargo test --test failover  # только failover-тесты
 ```
 
-Тесты покрывают: аутентификацию, rate limiter, валидацию JSON, clamp токенов, allowlist моделей, стриминг, обработку ошибок.
+Интеграционные тесты (`tests/failover.rs`) поднимают живые mock-серверы и настоящий прокси, проверяя failover «вживую»: 500 у первого → успех у второго, недоступный провайдер пропускается, 4xx отдаётся как есть без failover, префикс модели выбирает заданного провайдера, все недоступны → 502. Юнит-тесты покрывают разбор `UPSTREAMS`, валидацию URL, аутентификацию, rate limiter, маршрутизацию по префиксам, clamp токенов, allowlist, failover-статусы.
+
+> **Примечание:** если в вашем репозитории остался старый `tests/smoke.rs`, он потребует обновления под новый конфиг (`cfg.providers` вместо `cfg.ollama` / `cfg.upstream_base`).
 
 ## ⚠️ Известные ограничения
 
-1. **Python-код выполняется синхронно в рамках запроса**: Длительное выполнение (до 30с) блокирует слот конкурентности. При большом количестве code-execution запросов увеличьте `MAX_CONCURRENT`.
-2. **Нет кэширования результатов выполнения кода**: Один и тот же блок `` ```python `` выполняется заново при каждом запросе.
-3. **Вложенные fenced-блоки не поддерживаются**: Если внутри Python-кода есть `` ``` ``, парсинг может сработать некорректно.
-4. **HTTP разрешён только для localhost**: Для внутренних сервисов используйте HTTPS или настройте TLS-терминацию перед прокси.
+1. **Failover не ретраит внутри одного провайдера**: если провайдер «мигает» (часть запросов падает), повторов на нём самом нет — запрос сразу уходит следующему. Для ретраев используйте несколько записей одного сервиса с разными именами.
+2. **Задержка при недоступном первом провайдере**: попытка соединения занимает до `connect_timeout` (10 с) на каждого недоступного кандидата. Держите первый провайдер живым или ставьте первым того, кто отказывает быстро.
+3. **Failover не срабатывает после начала стрима**: если стрим оборвался на середине, клиент получает обрыв — продолжить у другого провайдера без дублирования ответа нельзя.
+4. **Python-код выполняется синхронно в рамках запроса**: длительное выполнение (до 30 с) блокирует слот конкурентности. При большом количестве code-execution запросов увеличьте `MAX_CONCURRENT`.
+5. **Нет кэширования результатов выполнения кода**: один и тот же блок `` ```python `` выполняется заново при каждом запросе.
+6. **Вложенные fenced-блоки не поддерживаются**: если внутри Python-кода есть `` ``` ``, парсинг может сработать некорректно.
+7. **HTTP разрешён только для localhost** (или при `ALLOW_HTTP_UPSTREAM=1`): для внешних сервисов используйте HTTPS.
+8. **Модели, уникальные для платного провайдера, лучше писать с префиксом** (`timeweb/gpt-4o`): непрефиксованная модель сначала спросит у бесплатного провайдера и получит 404 — попытка быстрая, но лишняя.
 
 ## 📄 Лицензия
 
-## Переменные окружения
-
-| Переменная | По умолчанию | Смысл |
-|---|---|---|
-| `PROXY_LISTEN` | `127.0.0.1:8080` | адрес, куда биндимся |
-| `PROXY_API_KEYS` | — (обязательно) | клиентские ключи через запятую, ≥16 симв. |
-| `UPSTREAM_API_KEY` | — (обязательно) | настоящий ключ платного провайдера |
-| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | базовый URL провайдера |
-| `ALLOWED_MODELS` | пусто (= все) | allowlist моделей, напр. `gpt-4o-mini,ollama/llama3` |
-| `MAX_OUTPUT_TOKENS` | 4096 | потолок `max_tokens` / `options.num_predict` |
-| `RATE_LIMIT_PER_MIN` | 60 | запросов на клиента в минуту |
-| `MAX_CONCURRENT` | 32 | одновременных запросов к платному провайдеру |
-| `REQUEST_TIMEOUT_SECS` | 120 | полный таймаут нестриминговых запросов |
-| `UPSTREAM_IDLE_TIMEOUT_SECS` | 120 | простой между кусками стрима |
-| `PYTHON_BIN` | — | python для выполнения ```python-блоков в промптах |
-| `ALLOW_HTTP_UPSTREAM` | 0 | разрешить http:// к НЕ-loopback upstream'ам |
-| `OLLAMA_ENABLED` | 1 | 0/false/no/off — выключить Ollama |
-| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | корневой URL Ollama (БЕЗ `/v1`!) |
-| `OLLAMA_API_KEY` | — | ключ, если Ollama за авторизацией |
-| `OLLAMA_MODEL_PREFIX` | `ollama/` | префикс маршрутизации в `/v1/chat/completions` |
-
-## Запуск
-
-```bash
-export PROXY_API_KEYS="openssl rand -hex 32"     # сгенерируйте ключи клиентов
-export UPSTREAM_API_KEY="sk-..."
-export ALLOWED_MODELS="gpt-4o-mini,ollama/llama3"
-cargo run --release
-```
-
-## Примеры
-
-```bash
-KEY="client-key-..."
-
-# обычный чат — уйдёт к платному провайдеру
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
-
-# та же точка входа, но модель с префиксом — уйдёт в Ollama как "llama3"
-curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}'
-
-# native Ollama API со стримом (NDJSON)
-curl -N http://127.0.0.1:8080/api/chat \
-  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
-  -d '{"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}'
-
-# список моделей: allowlist + модели Ollama
-curl -s http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $KEY"
-```
-
-## Тесты
-
-```bash
-cargo test            # 30 unit-тестов + сквозной смоук-тест
-cargo test --test smoke
-```
-
-Смоук-тест (`tests/smoke.rs`) поднимает мок-OpenAI и мок-Ollama (native + /v1),
-затем настоящий прокси, и проверяет живьём: маршрутизацию по префиксу,
-native-эндпоинты, NDJSON-стрим, allowlist, 401 без ключа, http-upstream'ы.
+MIT
