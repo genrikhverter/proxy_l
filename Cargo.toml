@@ -1,40 +1,29 @@
 [package]
 name = "llm-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.85"
-description = "Простой и безопасный HTTP-прокси к внешнему LLM-провайдеру (OpenAI-совместимый API)"
-license = "MIT"
+description = "Прокси к внешним LLM-провайдерам: OpenAI-совместимый API и локальная Ollama"
+
+[lib]
+name = "llm_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llm-proxy"
+path = "src/main.rs"
 
 [dependencies]
-# HTTP-сервер. axum — тонкая обёртка над hyper/tower, самый популярный выбор в экосистеме tokio.
-axum = "0.8"
-regex = "1"
-tempfile = "3"              # временные файлы для скриптов
-
-# Асинхронный рантайм: многопоточный планировщик + таймеры + каналы + обработка Ctrl-C.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "process"] }
-
-# HTTP-клиент к провайдеру.
-# default-features = false + rustls-tls => TLS на rustls (без OpenSSL и без cmake),
-# корневые сертификаты вшиты в бинарник (webpki-roots) — удобно для Docker.
-# "stream" нужен, чтобы отдавать SSE-ответ клиенту по кускам, не буферизуя его целиком.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "charset"] }
-
-# Разбор и правка JSON-тела запроса.
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Структурированные логи (без тел запросов и без ключей).
+subtle = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
 
-# Сравнение токенов за постоянное время (защита от timing-атак).
-subtle = "2"
-
-# Превращает mpsc-канал в Stream — нужен для стриминга с удержанием слота конкурентности.
-tokio-stream = "0.1"
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-strip = true
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

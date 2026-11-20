@@ -26,8 +26,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         listen = %cfg.listen,
         upstream = %cfg.upstream_base,
         models = if cfg.allowed_models.is_empty() { "любые (задайте ALLOWED_MODELS!)".to_string() } else { format!("{:?}", cfg.allowed_models) },
+        http_upstreams_allowed = cfg.allow_http,
         "прокси запущен"
     );
+
+    // Ollama: отдельная строка лога, чтобы было видно, куда пойдут запросы
+    // с префиксом ollama/ и native-эндпоинты /api/*.
+    match &cfg.ollama {
+        Some(oc) => tracing::info!(
+            ollama = %oc.base,
+            model_prefix = %oc.model_prefix,
+            auth = oc.api_key.is_some(),
+            "Ollama включена: /api/* и модели с префиксом {} маршрутизируются в неё",
+            oc.model_prefix
+        ),
+        None => tracing::info!("Ollama выключена (OLLAMA_ENABLED=0 или пустой OLLAMA_BASE_URL)"),
+    }
 
     // Graceful shutdown: по Ctrl-C перестаём принимать новые соединения
     // и даём текущим доработать (важно для длинных стримов при деплое).

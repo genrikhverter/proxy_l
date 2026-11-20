@@ -1,6 +1,4 @@
-Вот обновленный, подробный `README.md` и инструкция по запуску, учитывающие новую функциональность выполнения Python-кода из промптов.
 
----
 
 # LLM Proxy — "Безопасный" шлюз к LLM-провайдерам
 
@@ -20,6 +18,28 @@
 - **Безопасность сети**: Отключены редиректы (защита от SSRF и утечки токенов), валидация Base URL, разделение таймаутов для стримов и обычных запросов.
 - **Graceful Shutdown**: Корректное завершение активных стримов при SIGTERM/Ctrl-C.
 - **Fail-fast конфигурация**: Прокси не запустится с некорректными настройками.
+
+
+
+1. **Полноценная работа с Ollama** — два способа одновременно:
+   * маршрутизация из `/v1/chat/completions`: модель с префиксом `ollama/`
+     (например `ollama/llama3`) уходит в Ollama, префикс срезается;
+   * native-эндпоинты Ollama проксируются целиком: `POST /api/chat`,
+     `POST /api/generate`, `POST /api/embeddings`, `POST /api/show`,
+     `GET /api/tags`, `GET /api/version`.
+   NDJSON-стрим Ollama (`"stream": true`) проксируется с тем же backpressure,
+     что и SSE: слот конкурентности живёт до конца стрима, медленный клиент
+     тормозит чтение, память не растёт.
+   `/v1/models` теперь показывает и модели, установленные в Ollama
+     (`ollama/llama3`, `ollama/qwen2.5`, ...).
+   У Ollama свой пул слотов конкурентности (`MAX_CONCURRENT / 2`): тяжёлая
+     локальная модель не выедает слоты платного API.
+   Allowlist моделей проверяется по полному имени (`ollama/llama3`); для
+     native-запросов `/api/*` принимается и «голое» имя (`llama3`).
+
+
+
+
 
 ## 📁 Структура проекта
 
@@ -250,4 +270,67 @@ cargo test
 
 ## 📄 Лицензия
 
-MIT
+## Переменные окружения
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `PROXY_LISTEN` | `127.0.0.1:8080` | адрес, куда биндимся |
+| `PROXY_API_KEYS` | — (обязательно) | клиентские ключи через запятую, ≥16 симв. |
+| `UPSTREAM_API_KEY` | — (обязательно) | настоящий ключ платного провайдера |
+| `UPSTREAM_BASE_URL` | `https://api.openai.com/v1` | базовый URL провайдера |
+| `ALLOWED_MODELS` | пусто (= все) | allowlist моделей, напр. `gpt-4o-mini,ollama/llama3` |
+| `MAX_OUTPUT_TOKENS` | 4096 | потолок `max_tokens` / `options.num_predict` |
+| `RATE_LIMIT_PER_MIN` | 60 | запросов на клиента в минуту |
+| `MAX_CONCURRENT` | 32 | одновременных запросов к платному провайдеру |
+| `REQUEST_TIMEOUT_SECS` | 120 | полный таймаут нестриминговых запросов |
+| `UPSTREAM_IDLE_TIMEOUT_SECS` | 120 | простой между кусками стрима |
+| `PYTHON_BIN` | — | python для выполнения ```python-блоков в промптах |
+| `ALLOW_HTTP_UPSTREAM` | 0 | разрешить http:// к НЕ-loopback upstream'ам |
+| `OLLAMA_ENABLED` | 1 | 0/false/no/off — выключить Ollama |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | корневой URL Ollama (БЕЗ `/v1`!) |
+| `OLLAMA_API_KEY` | — | ключ, если Ollama за авторизацией |
+| `OLLAMA_MODEL_PREFIX` | `ollama/` | префикс маршрутизации в `/v1/chat/completions` |
+
+## Запуск
+
+```bash
+export PROXY_API_KEYS="openssl rand -hex 32"     # сгенерируйте ключи клиентов
+export UPSTREAM_API_KEY="sk-..."
+export ALLOWED_MODELS="gpt-4o-mini,ollama/llama3"
+cargo run --release
+```
+
+## Примеры
+
+```bash
+KEY="client-key-..."
+
+# обычный чат — уйдёт к платному провайдеру
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+# та же точка входа, но модель с префиксом — уйдёт в Ollama как "llama3"
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}'
+
+# native Ollama API со стримом (NDJSON)
+curl -N http://127.0.0.1:8080/api/chat \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"llama3","messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+# список моделей: allowlist + модели Ollama
+curl -s http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $KEY"
+```
+
+## Тесты
+
+```bash
+cargo test            # 30 unit-тестов + сквозной смоук-тест
+cargo test --test smoke
+```
+
+Смоук-тест (`tests/smoke.rs`) поднимает мок-OpenAI и мок-Ollama (native + /v1),
+затем настоящий прокси, и проверяет живьём: маршрутизацию по префиксу,
+native-эндпоинты, NDJSON-стрим, allowlist, 401 без ключа, http-upstream'ы.
