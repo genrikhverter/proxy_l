@@ -40,6 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             kind = if p.kind == llm_proxy::config::ProviderKind::Ollama { "ollama (+ /api/*)" } else { "openai-compatible" },
             auth = p.api_key.is_some(),
             model_prefix = %p.model_prefix,
+            default_model = %p.default_model.as_deref().unwrap_or("<не задана: запросы без model пропускаются>"),
             "провайдер настроен"
         );
     }

@@ -13,14 +13,20 @@
 //! 1. `UPSTREAMS` — единая строка, записи через запятую, поля через `|`:
 //!
 //! ```text
-//! UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx, ollama|http://127.0.0.1:11434|, vllm|http://192.168.1.10:8000/v1|token"
+//! UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx|model=gpt-4o, ollama|http://127.0.0.1:11434||model=llama3, vllm|http://192.168.1.10:8000/v1|token|model=qwen2.5"
 //! ```
 //!
-//! Формат записи: `имя|base_url[|api_key][|ollama]`.
+//! Формат записи: `имя|base_url[|api_key][|model= default][|ollama]` — после
+//! ключа допускаются опции в любом порядке и количестве:
+//! * `model=<имя>` — модель по умолчанию этого провайдера. Подставляется,
+//!   когда клиент не указал `model` в запросе: провайдеры имеют разные
+//!   каталоги моделей, и свой «дефолт» у каждого свой. Провайдер без
+//!   `model=` из такого запроса просто пропускается;
+//! * `ollama` — провайдер типа Ollama: дополнительно получает native-эндпоинты
+//!   `/api/*` (NDJSON-стримы, `/api/tags`, ...); провайдер с именем `ollama`
+//!   — ollama по умолчанию, даже без этой опции;
 //! * пустой `api_key` (или пропущенное поле) = запрос без Authorization
 //!   (локальная Ollama так и работает — отдельные настройки ей не нужны);
-//! * провайдер с именем `ollama` (или с явным 4-м полем `ollama`) дополнительно
-//!   получает native-эндпоинты `/api/*` (NDJSON-стримы, `/api/tags`, ...);
 //! * модель с префиксом `имя/` (например `ollama/llama3`, `openai/gpt-4o`)
 //!   маршрутизируется к этому провайдеру явно, минуя приоритет;
 //! * запрос без префикса идёт первому живому провайдеру по порядку.
@@ -30,6 +36,8 @@
 //!    автоматически на `http://127.0.0.1:11434` (никаких `OLLAMA_*` указывать
 //!    не нужно; старые переменные `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`,
 //!    `OLLAMA_MODEL_PREFIX`, `OLLAMA_ENABLED=0` продолжают работать).
+//!    Модели по умолчанию в legacy-режиме: `UPSTREAM_DEFAULT_MODEL` (primary)
+//!    и `OLLAMA_MODEL` (Ollama).
 //!
 //! Запросы к локальным провайдерам ходят по HTTP — это нормально для localhost.
 //! Для http к НЕ-loopback хостам включите `ALLOW_HTTP_UPSTREAM=1`.
@@ -84,6 +92,12 @@ pub struct ProviderConfig {
     /// запрос с моделью `ollama/llama3` уходит этому провайдеру как `llama3`.
     /// По умолчанию `{имя}/`.
     pub model_prefix: String,
+    /// Модель по умолчанию этого провайдера (опция `model=` в `UPSTREAMS`,
+    /// `UPSTREAM_DEFAULT_MODEL` / `OLLAMA_MODEL` в legacy-режиме).
+    /// Подставляется в запрос, когда клиент не указал `model`: у провайдеров
+    /// разные каталоги моделей, и каждому нужен свой «дефолт». Провайдер без
+    /// default-модели из запроса без `model` пропускается.
+    pub default_model: Option<String>,
 }
 
 impl ProviderConfig {
@@ -259,7 +273,8 @@ impl Config {
 
 /// Разбор `UPSTREAMS`: записи через запятую, поля через `|`.
 ///
-/// Формат записи: `имя|base_url[|api_key][|ollama]`.
+/// Формат записи: `имя|base_url[|api_key][|model=X][|ollama]` — опции
+/// (`ollama`, `model=X`) идут после ключа в любом порядке и количестве.
 /// Порядок записей = приоритет (первая запись — самый приоритетный провайдер).
 fn parse_upstreams(spec: &str, allow_http: bool) -> Result<Vec<ProviderConfig>, String> {
     let mut out = Vec::new();
@@ -267,9 +282,10 @@ fn parse_upstreams(spec: &str, allow_http: bool) -> Result<Vec<ProviderConfig>, 
     for (n, entry) in spec.split(',').map(str::trim).filter(|e| !e.is_empty()).enumerate() {
         let where_ = format!("UPSTREAMS, запись №{}", n + 1);
         let fields: Vec<&str> = entry.split('|').map(str::trim).collect();
-        if fields.len() < 2 || fields.len() > 4 {
+        if fields.len() < 2 || fields.len() > 6 {
             return Err(format!(
-                "{where_}: ожидается формат имя|base_url[|api_key][|ollama], получено «{entry}»"
+                "{where_}: ожидается формат \
+                 имя|base_url[|api_key][|model=X][|ollama], получено «{entry}»"
             ));
         }
 
@@ -292,23 +308,55 @@ fn parse_upstreams(spec: &str, allow_http: bool) -> Result<Vec<ProviderConfig>, 
         let base = validate_base_url(fields[1], allow_http)
             .map_err(|e| format!("{where_} (провайдер «{name}»): {e}"))?;
 
-        // Тип: явное 4-е поле `ollama` или имя провайдера `ollama`.
-        let kind = match fields.get(3) {
-            None => {
-                if name == "ollama" {
-                    ProviderKind::Ollama
-                } else {
-                    ProviderKind::OpenAi
-                }
+        // Поле №3 — ключ, НО если там записана опция (`ollama`, `model=...`) или
+        // пусто, значит ключ пропущен: позволяем писать `имя|url|model=gpt-4o`
+        // и `имя|url|ollama` без поля ключа. Опция остаётся в rest и разбирается ниже.
+        let mut rest: &[&str] = &fields[2..];
+        let api_key = match rest.first() {
+            // пустое поле = ключ пропущен, выбрасываем его из rest
+            Some(k) if k.is_empty() => {
+                rest = &rest[1..];
+                None
             }
-            Some(&"ollama") => ProviderKind::Ollama,
-            Some(other) => {
-                return Err(format!(
-                    "{where_} (провайдер «{name}»): неизвестный тип «{other}», \
-                     допустимо только «ollama»"
-                ))
+            // опция на месте ключа: ключа нет, опция остаётся в rest
+            Some(k) if *k == "ollama" || k.starts_with("model=") => None,
+            Some(k) => {
+                rest = &rest[1..];
+                Some((*k).to_string())
             }
+            None => None,
         };
+
+        // Опции: `ollama` — тип провайдера, `model=X` — модель по умолчанию.
+        let mut kind = if name == "ollama" {
+            ProviderKind::Ollama
+        } else {
+            ProviderKind::OpenAi
+        };
+        let mut default_model: Option<String> = None;
+        for opt in rest {
+            if *opt == "ollama" {
+                kind = ProviderKind::Ollama;
+            } else if let Some(model) = opt.strip_prefix("model=") {
+                if model.is_empty() {
+                    return Err(format!(
+                        "{where_} (провайдер «{name}»): пустое значение опции model= \
+                         — укажите имя модели или уберите опцию"
+                    ));
+                }
+                if default_model.is_some() {
+                    return Err(format!(
+                        "{where_} (провайдер «{name}»): опция model= указана дважды"
+                    ));
+                }
+                default_model = Some(model.to_string());
+            } else {
+                return Err(format!(
+                    "{where_} (провайдер «{name}»): неизвестная опция «{opt}», \
+                     допустимы «ollama» и «model=<имя модели>»"
+                ));
+            }
+        }
 
         // Ollama-провайдер — это корень без /v1 (native-пути /api/... клеятся к нему).
         // Частая ошибка: указать OpenAI-совместимый корень с /v1 — тогда получилось
@@ -321,15 +369,13 @@ fn parse_upstreams(spec: &str, allow_http: bool) -> Result<Vec<ProviderConfig>, 
             ));
         }
 
-        // Пустой ключ или пропущенное поле = запрос без Authorization.
-        let api_key = fields.get(2).filter(|k| !k.is_empty()).map(|s| s.to_string());
-
         out.push(ProviderConfig {
             name: name.to_string(),
             base,
             api_key,
             kind,
             model_prefix: format!("{name}/"),
+            default_model,
         });
     }
 
@@ -358,6 +404,11 @@ fn legacy_providers(allow_http: bool) -> Result<Vec<ProviderConfig>, String> {
         api_key: Some(upstream_api_key),
         kind: ProviderKind::OpenAi,
         model_prefix: "primary/".into(),
+        // Модель по умолчанию primary-провайдера (legacy-режим).
+        default_model: env::var("UPSTREAM_DEFAULT_MODEL")
+            .ok()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
     };
 
     let mut providers = vec![primary];
@@ -384,12 +435,18 @@ fn legacy_providers(allow_http: bool) -> Result<Vec<ProviderConfig>, String> {
                 .unwrap_or_else(|_| "ollama/".into())
                 .trim()
                 .to_string();
+            // Модель по умолчанию локальной Ollama (legacy-режим).
+            let default_model = env::var("OLLAMA_MODEL")
+                .ok()
+                .map(|m| m.trim().to_string())
+                .filter(|m| !m.is_empty());
             providers.push(ProviderConfig {
                 name: "ollama".into(),
                 base,
                 api_key,
                 kind: ProviderKind::Ollama,
                 model_prefix,
+                default_model,
             });
         }
     }
@@ -519,6 +576,7 @@ mod tests {
             api_key: Some("k".into()),
             kind: ProviderKind::OpenAi,
             model_prefix: "openai/".into(),
+            default_model: Some("gpt-4o-mini".into()),
         };
         assert_eq!(
             p.chat_completions_url().as_str(),
@@ -536,6 +594,7 @@ mod tests {
             api_key: None,
             kind: ProviderKind::Ollama,
             model_prefix: "ollama/".into(),
+            default_model: None,
         };
         assert_eq!(
             o.chat_completions_url().as_str(),
@@ -589,6 +648,52 @@ mod tests {
     }
 
     #[test]
+    fn upstreams_default_model_option_parsed() {
+        // ключ + model= + ollama — опции после ключа в любом порядке
+        let ps = parse_upstreams(
+            "openai|https://api.openai.com/v1|sk-xxx|model=gpt-4o, \
+             ollama|http://127.0.0.1:11434||model=llama3, \
+             vllm|http://192.168.1.10:8000/v1|token|model=qwen",
+            true,
+        )
+        .unwrap();
+        assert_eq!(ps[0].default_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(ps[0].api_key.as_deref(), Some("sk-xxx"));
+        assert_eq!(ps[0].kind, ProviderKind::OpenAi);
+        // пустое поле ключа + model= (ключа нет)
+        assert_eq!(ps[1].default_model.as_deref(), Some("llama3"));
+        assert_eq!(ps[1].api_key, None);
+        assert_eq!(ps[1].kind, ProviderKind::Ollama);
+        // model= после ключа
+        assert_eq!(ps[2].default_model.as_deref(), Some("qwen"));
+        assert_eq!(ps[2].api_key.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn upstreams_default_model_without_key_and_ollama_on_key_position() {
+        // ollama на месте ключа = пропуск ключа + тип ollama
+        let ps = parse_upstreams("local|http://127.0.0.1:11434|ollama|model=qwen2.5", false)
+            .unwrap();
+        assert_eq!(ps[0].kind, ProviderKind::Ollama);
+        assert_eq!(ps[0].api_key, None);
+        assert_eq!(ps[0].default_model.as_deref(), Some("qwen2.5"));
+
+        // вообще без опций — default_model отсутствует
+        let ps = parse_upstreams("a|https://x/v1|k", false).unwrap();
+        assert_eq!(ps[0].default_model, None);
+    }
+
+    #[test]
+    fn upstreams_bad_model_options_rejected() {
+        // пустое значение model=
+        assert!(parse_upstreams("a|https://x/v1|k|model=", false).is_err());
+        // дубликат model=
+        assert!(parse_upstreams("a|https://x/v1|k|model=x|model=y", false).is_err());
+        // неизвестная опция
+        assert!(parse_upstreams("a|https://x/v1|k|modelx", false).is_err());
+    }
+
+    #[test]
     fn upstreams_bad_entries_rejected() {
         // нет URL
         assert!(parse_upstreams("openai", false).is_err());
@@ -620,6 +725,7 @@ mod tests {
                     api_key: Some("k".into()),
                     kind: ProviderKind::OpenAi,
                     model_prefix: "openai/".into(),
+                    default_model: None,
                 },
                 ProviderConfig {
                     name: "ollama".into(),
@@ -627,6 +733,7 @@ mod tests {
                     api_key: None,
                     kind: ProviderKind::Ollama,
                     model_prefix: "ollama/".into(),
+                    default_model: None,
                 },
             ],
             client_keys: vec!["c".into()],

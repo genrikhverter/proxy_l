@@ -107,13 +107,37 @@ impl IntoResponse for AppError {
 
 /// Разобранное и приведённое в порядок тело запроса.
 pub struct Prepared {
-    pub body: Vec<u8>,
+    /// Разобранный JSON (санитизирован, потолки токенов срезаны). Тело для
+    /// конкретного провайдера собирается в dispatch — с ЕГО моделью.
+    pub value: Value,
     /// Имя модели так, как его указал клиент (для логов и allowlist).
-    pub model: String,
+    /// `None` — клиент не указал `model` (нет, null, пустая строка, "all").
+    pub model: Option<String>,
+    /// Модель, которую кладём в поле `model` исходящего запроса:
+    /// клиентская (без префикса провайдера). `None` — подставляется
+    /// default-модель того провайдера, который реально обслужит запрос.
+    pub send_model: Option<String>,
     pub stream: bool,
     /// Индекс провайдера, выбранного ЯВНО по префиксу модели (`ollama/llama3`).
     /// `None` — идём по приоритету через весь список с failover.
     pub explicit: Option<usize>,
+}
+
+impl Prepared {
+    /// Тело запроса для конкретного провайдера: поле `model` = клиентская
+    /// модель или default-модель этого провайдера (когда клиент её не указал).
+    /// `None` — у провайдера нет default-модели, а клиент не назвал модель:
+    /// такой провайдер из запроса без `model` пропускается.
+    fn body_for(&self, p: &ProviderConfig) -> Option<Vec<u8>> {
+        let mut value = self.value.clone();
+        let obj = value.as_object_mut()?;
+        let model = match &self.send_model {
+            Some(m) => m.clone(),
+            None => p.default_model.clone()?,
+        };
+        obj.insert("model".into(), json!(model));
+        serde_json::to_vec(&value).ok()
+    }
 }
 
 /// Какой OpenAI-совместимый эндпоинт вызываем у провайдера.
@@ -159,15 +183,17 @@ fn is_failover_status(status: StatusCode) -> bool {
 
 /// Единая отправка запроса по списку провайдеров с failover по приоритету.
 ///
-/// Для каждого кандидата по порядку: берём слот конкурентности, отправляем
-/// запрос; при сетевой ошибке, таймауте или фейловерном статусе — переходим
-/// к следующему. Первый успешный 2xx возвращается вместе со слотом
-/// (для стрима слот должен жить до конца потока).
+/// Для каждого кандидата по порядку: берём слот конкурентности, собираем тело
+/// С МОДЕЛЬЮ ЭТОГО провайдера (клиентскую или его default — у провайдеров
+/// разные каталоги моделей), отправляем; при сетевой ошибке, таймауте или
+/// фейловерном статусе — переходим к следующему. Провайдер без default-модели
+/// из запроса без `model` пропускается. Первый успешный 2xx возвращается
+/// вместе со слотом (для стрима слот должен жить до конца потока).
 async fn dispatch_with_failover(
     state: &AppState,
     candidates: &[usize],
     endpoint: Endpoint,
-    body: Vec<u8>,
+    prepared: &Prepared,
     accept: &'static str,
     // Полный таймаут ставим ТОЛЬКО нестриминговым запросам: у стрима ответ
     // может идти минутами, и общий таймаут оборвал бы его на середине.
@@ -176,9 +202,20 @@ async fn dispatch_with_failover(
 ) -> Result<Dispatched, AppError> {
     let mut last_status: Option<u16> = None;
     let mut busy: usize = 0;
+    let mut no_default: usize = 0;
 
     for &idx in candidates {
         let p = &state.cfg.providers[idx];
+
+        // Тело для ЭТОГО провайдера: model = клиентская или его default.
+        let Some(body) = prepared.body_for(p) else {
+            tracing::warn!(
+                provider = %p.name,
+                "в запросе нет model, а у провайдера нет модели по умолчанию (model= в UPSTREAMS) — пропускаем"
+            );
+            no_default += 1;
+            continue;
+        };
 
         // Слот конкурентности: не больше N одновременных обращений к этому
         // провайдеру. try_acquire — не ждём в очереди: если провайдер занят,
@@ -201,7 +238,7 @@ async fn dispatch_with_failover(
             .post(endpoint.url(p))
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, accept)
-            .body(body.clone());
+            .body(body);
 
         if let Some(key) = &p.api_key {
             request = request.bearer_auth(key);
@@ -271,9 +308,17 @@ async fn dispatch_with_failover(
         return Err(AppError::Busy);
     }
 
+    if no_default == candidates.len() {
+        // Ни у одного провайдера нет default-модели, а клиент не назвал модель.
+        return Err(AppError::BadRequest(
+            "Поле model обязательно: ни у одного провайдера нет модели по умолчанию \
+             (задайте model=<имя> в UPSTREAMS)",
+        ));
+    }
+
     Err(AppError::UpstreamAll(format!(
         "Ни один из {} провайдеров не обработал запрос{}",
-        candidates.len(),
+        candidates.len() - no_default,
         last_status
             .map(|s| format!(" (последний ответ провайдера: HTTP {s})"))
             .unwrap_or_default()
@@ -314,13 +359,14 @@ pub async fn chat_completions(
         return Err(AppError::NotFound("Не настроен ни один провайдер"));
     }
 
-    // 5-6. Запрос к провайдерам с failover.
+    // 5-6. Запрос к провайдерам с failover. Тело собирается в dispatch
+    //    отдельно для каждого провайдера (его модель из `model=` в UPSTREAMS).
     let accept = if prepared.stream { "text/event-stream" } else { "application/json" };
     let dispatched = dispatch_with_failover(
         &state,
         &candidates,
         Endpoint::ChatCompletions,
-        prepared.body.clone(),
+        &prepared,
         accept,
         !prepared.stream,
     )
@@ -343,9 +389,17 @@ pub async fn chat_completions(
                 ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
             };
 
+            // Модель, реально ушедшая провайдеру: клиентская или его default.
+            let served_model = prepared
+                .send_model
+                .clone()
+                .or_else(|| state.cfg.providers[provider].default_model.clone())
+                .unwrap_or_else(|| "<нет>".into());
+
             tracing::info!(
                 client,
-                model = %prepared.model,
+                model = %served_model,
+                requested = %prepared.model.as_deref().unwrap_or("<не указана>"),
                 provider = %state.cfg.providers[provider].name,
                 stream = prepared.stream,
                 ms = started.elapsed().as_millis() as u64,
@@ -603,8 +657,8 @@ pub async fn provider_model_list(state: &AppState, idx: usize) -> Option<Vec<Str
     )
 }
 
-/// Валидация тела native-запроса Ollama: JSON-объект, поле model,
-/// потолок `options.num_predict`, плюс python-санитизация сообщений чата.
+/// Валидация тела native-запроса Ollama: JSON-объект, model (или default-модель
+/// провайдера), потолок `options.num_predict`, плюс python-санитизация сообщений чата.
 async fn ollama_prepare_body(
     body: &[u8],
     cfg: &Config,
@@ -617,11 +671,18 @@ async fn ollama_prepare_body(
         .as_object_mut()
         .ok_or(AppError::BadRequest("Ожидался JSON-объект"))?;
 
-    let model = obj
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or(AppError::BadRequest("Поле model обязательно и должно быть строкой"))?
-        .to_string();
+    // model — необязательна: без неё (или "all") берётся default-модель
+    // ollama-провайдера.
+    let client_model: Option<String> = client_model_from(obj.get("model"))?;
+    let model = match client_model {
+        Some(m) => m,
+        None => oc.default_model.clone().ok_or(AppError::BadRequest(
+            "Поле model обязательно: у ollama-провайдера нет модели по умолчанию \
+             (задайте model=<имя> в UPSTREAMS или OLLAMA_MODEL)",
+        ))?,
+    };
+    // Нормализуем тело: модель всегда присутствует (подставленная или клиентская).
+    obj.insert("model".into(), json!(model.clone()));
 
     // Allowlist хранит имена так, как их указывает клиент через /v1 (с префиксом
     // ollama/...), а native-запросы приходят с «голым» именем. Пропускаем, если
@@ -924,6 +985,30 @@ async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8
     }
 }
 
+/// Модель, указанная клиентом в поле `model` запроса.
+///
+/// `None` — модель НЕ указана: поле отсутствует, `null`, пустая строка или
+/// строка `all` (без учёта регистра). В этом случае запрос идёт по приоритету,
+/// и каждому провайдеру подставляется ЕГО default-модель (`model=` в UPSTREAMS).
+/// Провайдеры без default-модели из такого запроса пропускаются.
+fn client_model_from(field: Option<&Value>) -> Result<Option<String>, AppError> {
+    match field {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+                Ok(None)
+            } else {
+                Ok(Some(s.clone()))
+            }
+        }
+        Some(_) => Err(AppError::BadRequest(
+            "Поле model должно быть строкой (или отсутствовать — тогда берётся \
+             модель по умолчанию провайдера)",
+        )),
+    }
+}
+
 /// Валидация и нормализация запроса `/v1/chat/completions`.
 ///
 /// Мы разбираем JSON и собираем его заново: наружу уходит ровно то, что проверили
@@ -932,6 +1017,11 @@ async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8
 /// Маршрутизация: модель с префиксом провайдера (`ollama/llama3`) помечается
 /// `explicit = Some(индекс)`, префикс срезается (провайдер его не знает).
 /// Модель без префикса идёт по приоритету всего списка.
+///
+/// Поле `model` НЕобязательно: если клиент его не указал (нет, null, пустая
+/// строка или `all` — без учёта регистра), запрос пойдёт по приоритету, и
+/// каждому провайдеру будет подставлена ЕГО default-модель (`model=` в
+/// UPSTREAMS). Провайдеры без default-модели из такого запроса пропускаются.
 async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError> {
     let mut value: Value = serde_json::from_slice(body)
         .map_err(|_| AppError::BadRequest("Тело запроса должно быть корректным JSON"))?;
@@ -940,37 +1030,42 @@ async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError
         .as_object_mut()
         .ok_or(AppError::BadRequest("Ожидался JSON-объект"))?;
 
-    // model — обязательна и должна быть в списке разрешённых.
-    let model = obj
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or(AppError::BadRequest(
-            "Поле model обязательно и должно быть строкой",
-        ))?
-        .to_string();
+    // model — необязательна; отсутствует/null/пустая/"all" → default-модель провайдера.
+    let client_model: Option<String> = client_model_from(obj.get("model"))?;
 
-    if !cfg.allowed_models.is_empty() && !cfg.allowed_models.contains(&model) {
-        return Err(AppError::Forbidden);
+    if let Some(model) = &client_model {
+        if !cfg.allowed_models.is_empty() && !cfg.allowed_models.contains(model) {
+            return Err(AppError::Forbidden);
+        }
     }
 
     // Явная маршрутизация по префиксу: у каждого провайдера свой префикс
     // (`ollama/`, `openai/`, ...). Проверяем allowlist по ПОЛНОМУ имени
     // (как его видит клиент), а наружу отдаём уже срезанное.
     let mut explicit = None;
-    let mut upstream_model = model.clone();
-    for (i, p) in cfg.providers.iter().enumerate() {
-        if p.model_prefix.is_empty() {
-            continue;
-        }
-        if let Some(stripped) = model.strip_prefix(&p.model_prefix) {
-            if stripped.is_empty() {
-                return Err(AppError::BadRequest(
-                    "После префикса провайдера должно быть имя модели",
-                ));
+    let mut send_model = client_model.clone();
+    if let Some(model) = &client_model {
+        for (i, p) in cfg.providers.iter().enumerate() {
+            if p.model_prefix.is_empty() {
+                continue;
             }
-            explicit = Some(i);
-            upstream_model = stripped.to_string();
-            break;
+            if let Some(stripped) = model.strip_prefix(&p.model_prefix) {
+                if stripped.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "После префикса провайдера должно быть имя модели",
+                    ));
+                }
+                // `ollama/all` — то же, что «модель не указана»: запрос идёт
+                // по приоритету, каждому провайдеру — его default-модель.
+                if stripped.eq_ignore_ascii_case("all") {
+                    explicit = None;
+                    send_model = None;
+                    break;
+                }
+                explicit = Some(i);
+                send_model = Some(stripped.to_string());
+                break;
+            }
         }
     }
 
@@ -1017,17 +1112,12 @@ async fn prepare_request(body: &[u8], cfg: &Config) -> Result<Prepared, AppError
         _ => return Err(AppError::BadRequest("stream должен быть true или false")),
     };
 
-    // Подставляем «внутреннее» имя модели (без префикса провайдера).
-    if explicit.is_some() {
-        obj.insert("model".into(), json!(upstream_model));
-    }
-
-    let body =
-        serde_json::to_vec(&value).map_err(|_| AppError::BadRequest("Не удалось собрать JSON"))?;
-
+    // Поле model в тело НЕ вставляем здесь: в dispatch оно подставляется
+    // отдельно для каждого провайдера (клиентская или его default-модель).
     Ok(Prepared {
-        body,
-        model,
+        value,
+        model: client_model,
+        send_model,
         stream,
         explicit,
     })
@@ -1046,6 +1136,7 @@ mod tests {
             api_key: Some("provider-key".into()),
             kind,
             model_prefix: format!("{name}/"),
+            default_model: None,
         }
     }
 
@@ -1093,7 +1184,7 @@ mod tests {
         let p = prepare_request(body, &single_cfg(&["gpt-4o-mini"], 100))
             .await
             .unwrap();
-        assert_eq!(p.model, "gpt-4o-mini");
+        assert_eq!(p.model.as_deref(), Some("gpt-4o-mini"));
         assert!(!p.stream);
         assert_eq!(p.explicit, None);
     }
@@ -1102,16 +1193,20 @@ mod tests {
     async fn max_tokens_is_clamped() {
         let body =
             br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#;
-        let p = prepare_request(body, &single_cfg(&[], 512)).await.unwrap();
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let c = single_cfg(&[], 512);
+        let p = prepare_request(body, &c).await.unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
         assert_eq!(v["max_tokens"], 512);
     }
 
     #[tokio::test]
     async fn max_completion_tokens_is_clamped_too() {
         let body = br#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":99999}"#;
-        let p = prepare_request(body, &single_cfg(&[], 512)).await.unwrap();
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let c = single_cfg(&[], 512);
+        let p = prepare_request(body, &c).await.unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
         assert_eq!(v["max_completion_tokens"], 512);
     }
 
@@ -1159,9 +1254,10 @@ mod tests {
         let body = br#"{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
         assert_eq!(p.explicit, Some(1), "префикс ollama/ → индекс 1");
-        assert_eq!(p.model, "ollama/llama3");
+        assert_eq!(p.model.as_deref(), Some("ollama/llama3"));
         // наружу уходит срезанное имя
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[1]).unwrap()).unwrap();
         assert_eq!(v["model"], "llama3");
     }
 
@@ -1174,7 +1270,8 @@ mod tests {
         let body = br#"{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
         assert_eq!(p.explicit, Some(0));
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
         assert_eq!(v["model"], "gpt-4o");
     }
 
@@ -1207,7 +1304,8 @@ mod tests {
         let body = br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
         assert_eq!(p.explicit, None, "без префикса — failover по приоритету");
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
         assert_eq!(v["model"], "gpt-4o-mini");
     }
 
@@ -1227,8 +1325,156 @@ mod tests {
         let body = br#"{"model":"ollama/llama3","messages":[{"role":"user","content":"hi"}]}"#;
         let p = prepare_request(body, &c).await.unwrap();
         assert_eq!(p.explicit, None);
-        let v: Value = serde_json::from_slice(&p.body).unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
         assert_eq!(v["model"], "ollama/llama3");
+    }
+
+    // ---- модель по умолчанию провайдера ----
+
+    fn cfg_with_defaults(providers: Vec<ProviderConfig>) -> Config {
+        cfg(providers, &[], 100)
+    }
+
+    #[tokio::test]
+    async fn no_model_uses_provider_default() {
+        let mut p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let c = cfg_with_defaults(vec![p1]);
+
+        // model нет вообще
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        assert_eq!(p.model, None, "клиент не указывал модель");
+        assert_eq!(p.send_model, None);
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
+        assert_eq!(v["model"], "gpt-4o-mini", "подставлена default-модель провайдера");
+    }
+
+    #[tokio::test]
+    async fn empty_or_null_model_treated_as_missing() {
+        let mut p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let c = cfg_with_defaults(vec![p1]);
+
+        for body in [
+            br#"{"model":"","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+            br#"{"model":null,"messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+        ] {
+            let p = prepare_request(body, &c).await.unwrap();
+            assert_eq!(p.model, None);
+        }
+        // не-строка — ошибка
+        let bad = br#"{"model":42,"messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(prepare_request(bad, &c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn model_all_uses_provider_default() {
+        let mut p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let c = cfg_with_defaults(vec![p1]);
+
+        // "all" в любом регистре и с пробелами — «модель не указана»
+        for body in [
+            br#"{"model":"all","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+            br#"{"model":"ALL","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+            br#"{"model":" All ","messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
+        ] {
+            let p = prepare_request(body, &c).await.unwrap();
+            assert_eq!(p.model, None, "{:?} — считается «не указана»", body);
+            assert_eq!(p.send_model, None);
+            let v: Value =
+                serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
+            assert_eq!(v["model"], "gpt-4o-mini", "подставлена default-модель провайдера");
+        }
+    }
+
+    #[tokio::test]
+    async fn prefixed_model_all_means_unspecified() {
+        let c = cfg_with_ollama(&[], 100, "ollama/");
+
+        // "ollama/all" — то же, что модель не указана: идём по приоритету
+        let body = br#"{"model":"ollama/all","messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        assert_eq!(p.explicit, None, "префикс+all НЕ закрепляет провайдера");
+        assert_eq!(p.send_model, None);
+    }
+
+    #[tokio::test]
+    async fn each_provider_gets_its_own_default() {
+        let mut p1 = provider("openai", "https://a.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let mut p2 = provider("ollama", "http://127.0.0.1:11434", ProviderKind::Ollama);
+        p2.api_key = None;
+        p2.default_model = Some("llama3".into());
+        let c = cfg_with_defaults(vec![p1, p2]);
+
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        let v1: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
+        let v2: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[1]).unwrap()).unwrap();
+        assert_eq!(v1["model"], "gpt-4o-mini", "первому — его default");
+        assert_eq!(v2["model"], "llama3", "второму — его default");
+    }
+
+    #[tokio::test]
+    async fn provider_without_default_skipped_when_no_model() {
+        let p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        let mut p2 = provider("ollama", "http://127.0.0.1:11434", ProviderKind::Ollama);
+        p2.api_key = None;
+        p2.default_model = Some("llama3".into());
+        let c = cfg_with_defaults(vec![p1, p2]);
+
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        // первый (без default) пропускается, тело собрать нельзя
+        assert_eq!(p.body_for(&c.providers[0]), None);
+        // второй обслужит
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[1]).unwrap()).unwrap();
+        assert_eq!(v["model"], "llama3");
+    }
+
+    #[tokio::test]
+    async fn no_model_without_any_default_is_rejected() {
+        let c = cfg_with_defaults(vec![provider(
+            "primary",
+            "https://api.example.com/v1",
+            ProviderKind::OpenAi,
+        )]);
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        assert_eq!(p.body_for(&c.providers[0]), None);
+    }
+
+    #[tokio::test]
+    async fn no_model_passes_allowlist_and_clamps_still_apply() {
+        let mut p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let c = cfg(vec![p1], &["cheap"], 512);
+
+        let body = br#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
+        assert_eq!(v["max_tokens"], 512, "потолок токенов действует и без model");
+    }
+
+    #[tokio::test]
+    async fn client_model_wins_over_default() {
+        let mut p1 = provider("primary", "https://api.example.com/v1", ProviderKind::OpenAi);
+        p1.default_model = Some("gpt-4o-mini".into());
+        let c = cfg_with_defaults(vec![p1]);
+
+        let body = br#"{"model":"user-model","messages":[{"role":"user","content":"hi"}]}"#;
+        let p = prepare_request(body, &c).await.unwrap();
+        let v: Value =
+            serde_json::from_slice(&p.body_for(&c.providers[0]).unwrap()).unwrap();
+        assert_eq!(v["model"], "user-model", "явно указанная модель сильнее default");
     }
 
     // ---- failover: какие статусы заставляют пробовать следующего ----
@@ -1268,6 +1514,36 @@ mod tests {
         let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
         assert!(ollama_prepare_body(body, &c, &oc).await.is_err());
         assert!(ollama_prepare_body(b"not json", &c, &oc).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ollama_native_default_model_used_when_no_model() {
+        // c default-моделью запрос без model проходит, модель подставлена
+        let mut c = cfg_with_ollama(&[], 100, "ollama/");
+        c.providers[1].default_model = Some("llama3".into());
+        let oc = c.ollama().unwrap().clone();
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let out = ollama_prepare_body(body, &c, &oc).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "llama3", "подставлена default-модель ollama");
+
+        // пустая строка в model — тоже считается «не указана»
+        let body = br#"{"model":"","messages":[{"role":"user","content":"hi"}]}"#;
+        let out = ollama_prepare_body(body, &c, &oc).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "llama3");
+
+        // "all" (любой регистр) — тоже «не указана»
+        let body = br#"{"model":"ALL","messages":[{"role":"user","content":"hi"}]}"#;
+        let out = ollama_prepare_body(body, &c, &oc).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "llama3");
+
+        // явная модель сильнее default
+        let body = br#"{"model":"qwen2.5","messages":[{"role":"user","content":"hi"}]}"#;
+        let out = ollama_prepare_body(body, &c, &oc).await.unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "qwen2.5");
     }
 
     #[tokio::test]
@@ -1324,18 +1600,18 @@ pub async fn image_generations(
         return Err(AppError::RateLimited);
     }
 
-    // 3. Базовая валидация JSON и проверка модели
+    // 3. Базовая валидация JSON; model необязательна (пустая/"all" — тоже
+    //    «не указана») — без неё берётся default-модель провайдера
+    //    (см. dispatch_with_failover).
     let value: Value = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("Тело запроса должно быть корректным JSON"))?;
 
-    let model = value
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or(AppError::BadRequest("Поле model обязательно"))?
-        .to_string();
+    let client_model: Option<String> = client_model_from(value.get("model"))?;
 
-    if !state.cfg.allowed_models.is_empty() && !state.cfg.allowed_models.contains(&model) {
-        return Err(AppError::Forbidden);
+    if let Some(model) = &client_model {
+        if !state.cfg.allowed_models.is_empty() && !state.cfg.allowed_models.contains(model) {
+            return Err(AppError::Forbidden);
+        }
     }
 
     // 4. Кандидаты — все провайдеры по приоритету.
@@ -1344,12 +1620,20 @@ pub async fn image_generations(
         return Err(AppError::NotFound("Не настроен ни один провайдер"));
     }
 
-    // 5-6. Запрос к провайдерам с failover.
+    // 5-6. Запрос к провайдерам с failover: тело собирается отдельно для
+    //    каждого провайдера с его default-моделью, если клиент не указал model.
+    let prepared = Prepared {
+        value,
+        model: client_model.clone(),
+        send_model: client_model.clone(),
+        stream: false,
+        explicit: None,
+    };
     let dispatched = dispatch_with_failover(
         &state,
         &candidates,
         Endpoint::Images,
-        body.to_vec(),
+        &prepared,
         "application/json",
         true,
     )
@@ -1369,9 +1653,16 @@ pub async fn image_generations(
         }
     };
 
+    // Модель, реально ушедшая провайдеру: клиентская или его default.
+    let served_model = client_model
+        .clone()
+        .or_else(|| state.cfg.providers[provider_idx].default_model.clone())
+        .unwrap_or_else(|| "<нет>".into());
+
     tracing::info!(
         client,
-        model = %model,
+        model = %served_model,
+        requested = %prepared.model.as_deref().unwrap_or("<не указана>"),
         provider = %state.cfg.providers[provider_idx].name,
         ms = started.elapsed().as_millis() as u64,
         "image generation completed"

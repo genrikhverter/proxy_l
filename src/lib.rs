@@ -218,6 +218,7 @@ mod tests {
             api_key: Some("provider-key".into()),
             kind,
             model_prefix: format!("{name}/"),
+            default_model: None,
         }
     }
 
