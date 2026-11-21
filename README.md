@@ -5,15 +5,16 @@
 ## ✨ Ключевые возможности
 
 - **Несколько провайдеров с приоритетами и failover**: провайдеры задаются списком `UPSTREAMS`, порядок = приоритет. Если провайдер не отвечает (сеть, таймаут, 401/403/404/408/429/5xx), тот же запрос автоматически уходит следующему по приоритету.
+- **Модели по умолчанию у каждого провайдера**: опция `model=` в записи `UPSTREAMS`. Если клиент не указал модель (нет поля, `null`, пустая строка или `"all"`), каждому провайдеру по цепочке подставляется **его** default-модель — у OpenAI-совместимых и у Ollama каталоги моделей разные, и «дефолт» у каждого свой.
 - **Унифицированный доступ**: все провайдеры — равноправные записи одного списка, каждый общается по OpenAI-совместимому протоколу. Ollama — обычный провайдер без ключа: отдельные настройки ей не нужны, по умолчанию она включается на `http://127.0.0.1:11434` как запасной провайдер.
 - **Безопасность ключей**: настоящий ключ каждого провайдера никогда не покидает сервер. Клиенты используют отдельные ключи с constant-time проверкой (защита от timing-атак).
 - **Выполнение кода из промптов**: автоматический поиск блоков `` ```python `` в сообщениях, выполнение через внешний интерпретатор и подстановка результата обратно в промпт **до** отправки провайдеру.
 - **Защита от злоупотреблений**:
   - Token Bucket Rate Limiter на каждого клиента;
   - семафор конкурентности **на каждого провайдера** (честный backpressure, 503 при перегрузке);
-  - лимиты на размер тела запроса/ответа;
+  - лимиты на размер тела запроса/ответа (тело 1 MiB, images 10 MiB; ответ 16 MiB, images 50 MiB);
   - allowlist моделей;
-  - clamp `max_tokens` / `max_completion_tokens`.
+  - clamp `max_tokens` / `max_completion_tokens` / `options.num_predict`.
 - **Стриминг (SSE и NDJSON)**: корректная поддержка с backpressure через ограниченный канал. Медленный клиент тормозит чтение у провайдера, память не растёт. Слот конкурентности живёт до конца стрима.
 - **Безопасность сети**: отключены редиректы (защита от SSRF и утечки токенов), валидация Base URL, заголовки собираются с нуля («белый список») — Authorization клиента, Cookie и Host не утекают наружу.
 - **Graceful Shutdown**: корректное завершение активных стримов при SIGTERM/Ctrl-C.
@@ -25,6 +26,21 @@
 
 1. **Модель с префиксом `имя/`** (`timeweb/gpt-4o`, `ollama/llama3`) уходит **заданному** провайдеру — префикс срезается, failover не выполняется.
 2. **Модель без префикса** идёт **первому живому провайдеру по приоритету**.
+3. **Модель не указана** (нет поля, `null`, пустая строка или `"all"` — без учёта регистра) — запрос идёт **по приоритету всем списком**, и каждому провайдеру подставляется **его** default-модель из `model=` записи `UPSTREAMS`. Провайдер без default-модели из такого запроса пропускается. Форма `имя/all` (например, `ollama/all`) эквивалентна запросу без модели.
+
+```bash
+# UPSTREAMS с default-моделями:
+export UPSTREAMS="\
+ollama|http://172.16.162.33:11434||model=llama3.1:8b, \
+timeweb|https://api.timeweb.ai/v1|sk-...|model=gpt-4o"
+
+# Запрос БЕЗ model → Ollama получит llama3.1:8b; если она недоступна,
+# timeweb получит gpt-4o. Каждый — свою модель.
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer client-key-..." \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Привет!"}]}'
+```
 
 ### Когда запрос уходит следующему провайдеру
 
@@ -43,6 +59,8 @@
 
 - **Экономия**: поставьте бесплатную Ollama первым — лёгкий трафик идёт бесплатно, платный API берёт на себя только то, чего нет в Ollama (или когда она выключена).
 - **Отказоустойчивость**: выключение любого провайдера не ломает сервис — запрос переезжает к следующему.
+- **Клиентов с фиксированной моделью можно не переписывать**: если клиент шлёт `model: "all"` (или не шлёт модель вовсе), запрос всё равно обслуживается — модель подставит прокси.
+- **Allowlist и запросы без модели**: allowlist `ALLOWED_MODELS` проверяет только явно указанные модели; запрос без модели (или с `"all"`) им не ограничивается — для него подставляются default-модели из `UPSTREAMS`.
 - Провайдер без поддержки Images API (например, Ollama) вернёт 404/501, и запрос генерации изображений уйдёт следующему — failover работает и для `/v1/images/generations`.
 
 ## 📁 Структура проекта
@@ -51,9 +69,9 @@
 src/
 ├── main.rs       # Точка входа, логирование провайдеров, graceful shutdown
 ├── lib.rs        # AppState (пул слотов на провайдера), роутер, /v1/models
-├── config.rs     # UPSTREAMS/ENV, ProviderConfig, валидация URL
+├── config.rs     # UPSTREAMS/ENV, ProviderConfig (включая default_model), валидация URL
 ├── security.rs   # Аутентификация, rate limiter
-└── proxy.rs      # dispatch с failover, санитизация, выполнение Python-кода
+└── proxy.rs      # dispatch с failover, подстановка default-моделей, санитизация, Python-код
 tests/
 └── failover.rs   # Интеграционные тесты failover на живых mock-серверах
 start.sh          # Пример запуска (бесплатный провайдер → платные)
@@ -83,7 +101,7 @@ cargo build --release
 export PROXY_API_KEYS="client-key-aaaaaaaaaaaaaaaa,client-key-bbbbbbbbbbbbbbbb"
 
 # Провайдеры по приоритету: первая запись обрабатывает запрос первой
-export UPSTREAMS="ollama|http://127.0.0.1:11434|, openai|https://api.openai.com/v1|sk-xxx"
+export UPSTREAMS="ollama|http://127.0.0.1:11434||model=llama3.1:8b, openai|https://api.openai.com/v1|sk-xxx|model=gpt-4o-mini"
 
 # === ОПЦИОНАЛЬНЫЕ ===
 export PROXY_LISTEN="127.0.0.1:8080"
@@ -119,10 +137,18 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "ollama/llama3", "messages": [{"role": "user", "content": "hi"}]}'
 
+# Запрос БЕЗ model (или с "model":"all") — каждый провайдер получит
+# СВОЮ default-модель из UPSTREAMS, обслужит первый живой
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "all", "messages": [{"role": "user", "content": "Привет!"}]}'
+
 # Список моделей: allowlist + модели каждого провайдера с его префиксом
 curl http://127.0.0.1:8080/v1/models -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa"
 
-# Native Ollama API со стримом (NDJSON)
+# Native Ollama API со стримом (NDJSON); model можно не указывать —
+# подставится default-модель ollama-провайдера
 curl -N http://127.0.0.1:8080/api/chat \
   -H "Authorization: Bearer client-key-aaaaaaaaaaaaaaaa" \
   -H "Content-Type: application/json" \
@@ -148,7 +174,7 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
 Формат: записи через запятую, поля через `|`.
 
 ```
-UPSTREAMS="имя|base_url[|api_key][|ollama], ..."
+UPSTREAMS="имя|base_url[|api_key][|model=модель][|ollama], ..."
 ```
 
 | Поле | Значение |
@@ -156,74 +182,81 @@ UPSTREAMS="имя|base_url[|api_key][|ollama], ..."
 | `имя` | строчные латинские буквы/цифры/`-`/`_`, ≤ 32 символов, уникально. Используется в логах и как префикс моделей `{имя}/` |
 | `base_url` | OpenAI-совместимые — **с `/v1`**; Ollama — **корень без `/v1`** |
 | `api_key` | ключ провайдера; пустое поле или пропущено = запрос **без** Authorization |
-| `ollama` | необязательное 4-е поле: провайдер с native-эндпоинтами `/api/*`; провайдер с именем `ollama` получает этот тип автоматически |
+| `model=` | default-модель **этого** провайдера: подставляется, когда клиент не указал `model` (нет поля, `null`, пустая строка, `"all"`). Провайдер без `model=` из такого запроса пропускается |
+| `ollama` | опция-флаг (в любой позиции после `base_url`): провайдер с native-эндпоинтами `/api/*`; провайдер с именем `ollama` получает этот тип автоматически (флаг нужен для другого имени) |
+
+Поля-опции (`model=...`, `ollama`) можно писать **на месте ключа** или после него в любом порядке: если на месте ключа записана опция или пусто, ключ считается пропущенным — `имя|url|model=gpt-4o` и `имя|url|ollama` корректны.
 
 ### Примеры base_url
 
 ```bash
 # OpenAI
-export UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx"
+export UPSTREAMS="openai|https://api.openai.com/v1|sk-xxx|model=gpt-4o-mini"
 # OpenRouter
-export UPSTREAMS="openrouter|https://openrouter.ai/api/v1|sk-or-v1-..."
+export UPSTREAMS="openrouter|https://openrouter.ai/api/v1|sk-or-v1-...|model=anthropic/claude-3.5-haiku"
 # Timeweb Cloud
-export UPSTREAMS="timeweb|https://api.timeweb.ai/v1|sk-..."
+export UPSTREAMS="timeweb|https://api.timeweb.ai/v1|sk-...|model=gpt-4o"
 # cloud.ru Foundation Models
-export UPSTREAMS="cloudru|https://foundation-models.api.cloud.ru/v1|token"
+export UPSTREAMS="cloudru|https://foundation-models.api.cloud.ru/v1|token|model=qwen2.5-72b-instruct"
 # Локальный vLLM (без ключа — запрос пойдёт без Authorization)
-export UPSTREAMS="vllm|http://127.0.0.1:8000/v1|"
-# Ollama (тип ollama задаётся именем или 4-м полем)
-export UPSTREAMS="ollama|http://127.0.0.1:11434|"
-export UPSTREAMS="local|http://192.168.1.10:11434||ollama"
+export UPSTREAMS="vllm|http://127.0.0.1:8000/v1||model=qwen2.5-72b-instruct"
+# Ollama (тип ollama задаётся именем или опцией-флагом)
+export UPSTREAMS="ollama|http://127.0.0.1:11434||model=llama3.1:8b"
+export UPSTREAMS="local|http://192.168.1.10:11434|ollama|model=qwen2.5:7b"
 ```
 
 ### Цепочка «бесплатный → платные» (см. start.sh)
 
 ```bash
-export UPSTREAMS="ollama|http://172.16.162.33:11434|, \
-  timeweb|https://api.timeweb.ai/v1|sk-..., \
-  openrouter|https://openrouter.ai/api/v1|sk-or-v1-..., \
-  cloudru|https://foundation-models.api.cloud.ru/v1|token"
+export UPSTREAMS="ollama|http://172.16.162.33:11434||model=llama3.1:8b, \
+  timeweb|https://api.timeweb.ai/v1|sk-...|model=gpt-4o, \
+  openrouter|https://openrouter.ai/api/v1|sk-or-v1-...|model=anthropic/claude-3.5-haiku, \
+  cloudru|https://foundation-models.api.cloud.ru/v1|token|model=qwen2.5-72b-instruct"
 export ALLOW_HTTP_UPSTREAM=1   # нужен для http к НЕ-loopback хостам (Ollama в LAN)
 ```
 
 ### Обратная совместимость
 
-Старые переменные продолжают работать, если `UPSTREAMS` не задан: `UPSTREAM_BASE_URL` + `UPSTREAM_API_KEY` создают провайдера `primary`, а Ollama **автоматически** включается на `http://127.0.0.1:11434` как запасной провайдер — `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL_PREFIX`, `OLLAMA_ENABLED=0` поддерживаются, но требуются только для нестандартных установок.
+Старые переменные продолжают работать, если `UPSTREAMS` не задан: `UPSTREAM_BASE_URL` + `UPSTREAM_API_KEY` создают провайдера `primary` (его default-модель — `UPSTREAM_DEFAULT_MODEL`), а Ollama **автоматически** включается на `http://127.0.0.1:11434` как запасной провайдер — `OLLAMA_BASE_URL`, `OLLAMA_API_KEY`, `OLLAMA_MODEL_PREFIX`, `OLLAMA_MODEL` (default-модель авт-Ollama), `OLLAMA_ENABLED=0` поддерживаются, но требуются только для нестандартных установок.
 
 ## 🦙 Полноценная работа с Ollama
 
 Ollama — обычный провайдер в общем списке (`kind = ollama`), но с двумя особенностями:
 
-- **Native-эндпоинты проксируются целиком** (на первого провайдера типа ollama): `POST /api/chat`, `POST /api/generate`, `POST /api/embeddings`, `POST /api/show`, `GET /api/tags`, `GET /api/version`. NDJSON-стрим (`"stream": true`) проксируется с тем же backpressure, что и SSE: слот конкурентности живёт до конца стрима, медленный клиент тормозит чтение, память не растёт.
+- **Native-эндпоинты проксируются целиком** (на первого провайдера типа ollama): `POST /api/chat`, `POST /api/generate`, `POST /api/embeddings`, `POST /api/show`, `GET /api/tags`, `GET /api/version`. NDJSON-стрим (`"stream": true`) проксируется с тем же backpressure, что и SSE: слот конкурентности живёт до конца стрима, медленный клиент тормозит чтение, память не растёт. Для native-запросов действует то же правило default-моделей: без `model` (или с `"all"`) подставляется default-модель ollama-провайдера.
 - **Allowlist моделей** проверяется по полному имени (`ollama/llama3`); для native-запросов `/api/*` принимается и «голое» имя (`llama3`), и имя с префиксом.
 
-У Ollama свой пул слотов конкурентности (`MAX_CONCURRENT / 2`): тяжёлая локальная модель не выедает слоты платного API.
+У Ollama свой пул слотов конкурентности (`MAX_CONCURRENT / 2`, минимум 1): тяжёлая локальная модель не выедает слоты платного API.
 
 ## 🏗️ Архитектура обработки запроса
 
 ```
 Клиент → [Auth] → [Rate Limit] → [Parse JSON] → [Sanitize + Python Exec]
        → [Clamp max_tokens] → [Кандидаты: префикс → 1 провайдер | весь список]
-       → [Acquire Slot провайдера] → [Upstream Request]
+       → [Acquire Slot провайдера] → [Body: клиентская модель или default провайдера]
+       → [Upstream Request]
        →   не отвечает / 401/403/404/408/429/5xx → следующий по приоритету
        → [Stream / Read Response] → Клиент
 ```
 
-Порядок проверок оптимизирован: дешёвые проверки (ключ, лимит, JSON) выполняются **до** дорогого сетевого запроса. Мусорный трафик не доходит ни до одного провайдера. Ключ провайдера подставляется только в момент отправки — свой для каждого.
+Порядок проверок оптимизирован: дешёвые проверки (ключ, лимит, JSON) выполняются **до** дорогого сетевого запроса. Мусорный трафик не доходит ни до одного провайдера. Ключ провайдера подставляется только в момент отправки — свой для каждого. Тело для каждого провайдера собирается отдельно: поле `model` = клиентская модель или его default — у провайдеров разные каталоги.
+
+В логе обработки запроса видно обе модели: `requested` — что прислал клиент (`<не указана>`, если модель не передана/пустая/`"all"`), `model` — какая реально ушла провайдеру.
 
 ## 📊 Переменные окружения (полная таблица)
 
 | Переменная | Обязательна | По умолчанию | Описание |
 |-----------|:-----------:|-------------|----------|
 | `PROXY_API_KEYS` | ✅ | — | Ключи клиентов через запятую (≥16 симв. каждый) |
-| `UPSTREAMS` | ✅* | — | Провайдеры по приоритету: `имя\|base_url[\|ключ][\|ollama], ...` |
+| `UPSTREAMS` | ✅* | — | Провайдеры по приоритету: `имя\|base_url[\|ключ][\|model=модель][\|ollama], ...` |
 | `UPSTREAM_API_KEY` | ✅* | — | Ключ провайдера (старый способ) |
 | `UPSTREAM_BASE_URL` | | `https://api.openai.com/v1` | Base URL провайдера (старый способ) |
+| `UPSTREAM_DEFAULT_MODEL` | | *(нет)* | Default-модель провайдера `primary` (старый способ) |
 | `PROXY_LISTEN` | | `127.0.0.1:8080` | Адрес прослушивания |
 | `ALLOWED_MODELS` | | *(все)* | Разрешённые модели через запятую, с префиксами |
 | `MAX_OUTPUT_TOKENS` | | `4096` | Потолок max_tokens/max_completion_tokens/num_predict |
 | `RATE_LIMIT_PER_MIN` | | `60` | Лимит запросов/мин на клиента |
-| `MAX_CONCURRENT` | | `32` | Макс одновременных запросов к одному провайдеру |
+| `MAX_CONCURRENT` | | `32` | Макс одновременных запросов к одному провайдеру (у Ollama — половина) |
 | `REQUEST_TIMEOUT_SECS` | | `120` | Таймаут нестриминговых запросов (1–600) |
 | `UPSTREAM_IDLE_TIMEOUT_SECS` | | `120` | Idle-таймаут стримов (1–600) |
 | `PYTHON_BIN` | | *(нет)* | Путь к Python-интерпретатору |
@@ -232,6 +265,7 @@ Ollama — обычный провайдер в общем списке (`kind =
 | `OLLAMA_BASE_URL` | | `http://127.0.0.1:11434` | Корневой URL Ollama БЕЗ `/v1` (старый способ) |
 | `OLLAMA_API_KEY` | | *(нет)* | Ключ, если Ollama за авторизацией (старый способ) |
 | `OLLAMA_MODEL_PREFIX` | | `ollama/` | Префикс маршрутизации (старый способ) |
+| `OLLAMA_MODEL` | | *(нет)* | Default-модель авто-Ollama (старый способ) |
 | `RUST_LOG` | | `info` | Уровень логирования (trace/debug/info/warn/error) |
 
 \* Обязателен `UPSTREAMS` **или** пара `UPSTREAM_API_KEY` + `UPSTREAM_BASE_URL` (старый способ). Хотя бы один провайдер должен быть настроен.
@@ -284,11 +318,11 @@ export PYTHON_BIN="/usr/local/bin/bwrap-python"
 ## 🧪 Тесты
 
 ```bash
-cargo test                  # 37 юнит-тестов + 5 интеграционных
+cargo test                  # 50 юнит-тестов + 8 интеграционных
 cargo test --test failover  # только failover-тесты
 ```
 
-Интеграционные тесты (`tests/failover.rs`) поднимают живые mock-серверы и настоящий прокси, проверяя failover «вживую»: 500 у первого → успех у второго, недоступный провайдер пропускается, 4xx отдаётся как есть без failover, префикс модели выбирает заданного провайдера, все недоступны → 502. Юнит-тесты покрывают разбор `UPSTREAMS`, валидацию URL, аутентификацию, rate limiter, маршрутизацию по префиксам, clamp токенов, allowlist, failover-статусы.
+Интеграционные тесты (`tests/failover.rs`) поднимают живые mock-серверы и настоящий прокси, проверяя failover «вживую»: 500 у первого → успех у второго, недоступный провайдер пропускается, 4xx отдаётся как есть без failover, префикс модели выбирает заданного провайдера, все недоступны → 502. Юнит-тесты покрывают разбор `UPSTREAMS` (включая опцию `model=`), валидацию URL, аутентификацию, rate limiter, маршрутизацию по префиксам (включая `имя/all`), подстановку default-моделей (`"all"`/пустая/отсутствие → default провайдера), clamp токенов, allowlist, failover-статусы.
 
 > **Примечание:** если в вашем репозитории остался старый `tests/smoke.rs`, он потребует обновления под новый конфиг (`cfg.providers` вместо `cfg.ollama` / `cfg.upstream_base`).
 
@@ -302,6 +336,7 @@ cargo test --test failover  # только failover-тесты
 6. **Вложенные fenced-блоки не поддерживаются**: если внутри Python-кода есть `` ``` ``, парсинг может сработать некорректно.
 7. **HTTP разрешён только для localhost** (или при `ALLOW_HTTP_UPSTREAM=1`): для внешних сервисов используйте HTTPS.
 8. **Модели, уникальные для платного провайдера, лучше писать с префиксом** (`timeweb/gpt-4o`): непрефиксованная модель сначала спросит у бесплатного провайдера и получит 404 — попытка быстрая, но лишняя.
+9. **Запрос без модели идёт всем списком**: если ни у одного провайдера нет `model=`, клиент получит ошибку — задайте default-модель хотя бы одному провайдеру, если ваши клиенты не указывают `model`.
 
 ## 📄 Лицензия
 
